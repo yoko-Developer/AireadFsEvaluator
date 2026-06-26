@@ -1,0 +1,9 @@
+regex	replace_char
+#共通#	#共通#
+[UuOoCc(¢@]	0
+\][Il]|[lIi\]」!\|:;]	1
+[Zz]	2
+fi|[fbEG]	6
+[SsB]	8
+[gq]	9
+(\,)	.
