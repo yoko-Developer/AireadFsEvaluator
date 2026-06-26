@@ -1,18 +1,18 @@
-# AIReadAccuracyEvaluationTest - テストガイド
+# AireadFsEvaluator - テストガイド
 
 ## 概要
 
-このドキュメントでは、AIReadAccuracyEvaluationTestプロジェクトのテスト実装と実行方法について説明します。
+このドキュメントでは、AireadFsEvaluator（決算書精度評価ツール）プロジェクトにおけるテストの構造と、ユニットテスト（UT）の実行方法について説明します。
 
 ## テスト構造
 
 ```
 tests/
-├── __init__.py                # testsパッケージ初期化
-├── conftest.py               # pytestフィクスチャとグローバル設定
-├── test_path_utils.py        # path_utilsモジュールのテスト
-├── test_fal_evaluator.py     # FalEvaluatorクラスのテスト
-└── test_main.py              # mainモジュールのテスト
+├── __init__.py               # testsパッケージ初期化
+├── conftest.py               # pytestフィクスチャとテスト用サンプルCSVの定義
+├── test_path_utils.py        # パス操作ユーティリティ関数のテスト
+├── test_fal_evaluator.py     # Csv4dbEvaluatorクラスのテスト
+└── test_main.py              # mainモジュールの総合テスト
 ```
 
 ## テスト環境のセットアップ
@@ -45,26 +45,27 @@ pip install -r requirements-test.txt
 ### 基本的な実行
 
 ```cmd
-# 全テストを実行
+# 全テスト（UT/IT）を一括実行
 pytest
 
-# 特定のテストファイルを実行
-pytest tests/test_path_utils.py
+# 特定のテストファイル（UT）のみを実行
+pytest tests/test_csv4db_evaluator.py
 
 # 特定のテストクラスを実行
-pytest tests/test_fal_evaluator.py::TestFalEvaluatorInit
+pytest tests/test_csv4db_evaluator.py::TestCsv4dbEvaluatorInit
 
 # 特定のテストケースを実行
-pytest tests/test_fal_evaluator.py::TestFalEvaluatorInit::test_initialization_creates_session_dir
+pytest tests/test_csv4db_evaluator.py::TestCsv4dbEvaluatorInit::test_initialization_creates_session_dir -v
 ```
 
-### 詳細な出力で実行
+### 詳細な出力で実行（debug用）
+テストが失敗した時や、詳しい動きを追いたい時に使用します。
 
 ```cmd
-# より詳細な出力
+# より詳細な出力（全テスト名が表示）
 pytest -v
 
-# さらに詳細な出力（各テストの詳細を表示）
+# さらに詳細な出力（各テストの差分詳細を表示）
 pytest -vv
 
 # 失敗したテストのみ表示
@@ -72,6 +73,8 @@ pytest --tb=short
 ```
 
 ### カバレッジレポートの生成
+カバレッジレポート（テスト網羅率）の生成
+プログラムの何パーセントをテストでカバーできたかを計測し、HTMLで視覚的に確認します。
 
 ```cmd
 # カバレッジを計測しながらテスト実行
@@ -87,7 +90,7 @@ pytest --cov=src --cov-report=html
 # ユニットテストのみ実行
 pytest -m unit
 
-# 統合テストのみ実行
+# インテグレーションテストのみ実行
 pytest -m integration
 
 # 特定のマーカー以外を実行
@@ -99,17 +102,16 @@ pytest -m "not slow"
 ### 1. ユニットテスト
 
 個々の関数やメソッドが正しく動作することを確認するテストです。
-
-- `test_path_utils.py`: パスユーティリティ関数のテスト
+- test_path_utils.py: パスユーティリティ関数のテスト
   - ディレクトリ/ファイルの検証
   - プロジェクトルートの取得
   - ディレクトリのセットアップ
 
 ### 2. クラステスト
 
-FalEvaluatorクラスの各メソッドが正しく動作することを確認するテストです。
+Csv4dbEvaluatorクラスの各メソッドが正しく動作することを確認するテストです。
 
-- `test_fal_evaluator.py`: FalEvaluatorのテスト
+- `test_csv4db_evaluator.py`: Csv4dbEvaluatorのテスト
   - 初期化処理
   - テキスト正規化
   - 類似度計算
@@ -117,11 +119,11 @@ FalEvaluatorクラスの各メソッドが正しく動作することを確認�
   - CSVファイルの読み込み
   - 差分抽出
 
-### 3. 統合テスト
+### 3. インテグレーションテスト
 
 複数のコンポーネントが連携して動作することを確認するテストです。
 
-- `test_main.py`: mainモジュールの統合テスト
+- `test_main.py`: main.pyのエンドツーエンドテスト
   - コマンドライン引数の解析
   - 設定ファイルの読み込み
   - エンドツーエンドの実行フロー
@@ -152,7 +154,7 @@ ModuleNotFoundError: No module named 'src'
 **解決策**: プロジェクトルートディレクトリで実行してください。
 
 ```cmd
-cd C:\work\repository\AIReadAccuracyEvaluationTest
+cd AireadFsEvaluator
 pytest
 ```
 
@@ -212,9 +214,3 @@ pytest -vv --tb=long
 3. **一時ディレクトリの使用**: `tmp_path`フィクスチャを使用してテスト用の一時ファイルを作成
 4. **モックの活用**: 外部依存を持つコードはモックを使用してテスト
 5. **適切なアサーション**: 期待される結果を明確にアサーション
-
-## 参考資料
-
-- [pytest公式ドキュメント](https://docs.pytest.org/)
-- [pytest-cov](https://pytest-cov.readthedocs.io/)
-- [Python Testing Best Practices](https://docs.python-guide.org/writing/tests/)
