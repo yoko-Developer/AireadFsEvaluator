@@ -52,9 +52,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_config(config_file: Path) -> dict:
-    if not config_file.exists():
-        raise FileNotFoundError("Config file not found")
-
+    # 絶対パスに強制解決
+    absolute_path = config_file.resolve()
+    if not absolute_path.exists():
+        raise FileNotFoundError(f"Config file not found at: {absolute_path}")
+    
     with open(config_file, "rb") as f:
         return tomllib.load(f)
 
