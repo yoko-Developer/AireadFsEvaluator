@@ -75,7 +75,7 @@ def button_click():
 </head>
 <body>
     <div class="container">
-        <h1>読込完了</h1>
+        <h1>summary</h1>
         <p>テスト結果表示</p>
         <div class="badge">正解率 100%</div>
     </div>
