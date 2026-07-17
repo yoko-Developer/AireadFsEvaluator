@@ -1,0 +1,122 @@
+{
+    "CTk": {
+        "fg_color": ["#FFF0F5", "#121212"]
+    },
+    "CTkFrame": {
+        "fg_color": ["#FFF5F7", "#1E1E1E"],
+        "top_level_fg_color": ["#FFF0F5", "#121212"],
+        "border_color": ["#FFB7C5", "#ff7bd5"],
+        "border_width": 2,
+        "corner_radius": 8
+    },
+    "CTkButton": {
+        "fg_color": ["#FFB7C5", "#ff7bd5"],
+        "hover_color": ["#FFA4B6", "#ff52cb"],
+        "text_color": ["#FFFFFF", "#FFFFFF"],
+        "text_color_disabled": ["#A0A0A0", "#707070"],
+        "border_color": ["#FF91A4", "#ff7bd5"],
+        "border_width": 0,
+        "corner_radius": 8
+    },
+    "CTkLabel": {
+        "fg_color": "transparent",
+        "text_color": ["#D87093", "#FFFFFF"],
+        "corner_radius": 0
+    },
+    "CTkEntry": {
+        "fg_color": ["#FFFFFF", "#1E1E1E"],
+        "border_color": ["#FFB7C5", "#ff7bd5"],
+        "text_color": ["#000000", "#FFFFFF"],
+        "placeholder_text_color": ["#A0A0A0", "#707070"],
+        "border_width": 2,
+        "corner_radius": 6
+    },
+    "CTkCanvas": {
+        "background_color": ["#FFF0F5", "#121212"]
+    },
+    "CTkScrollbar": {
+        "fg_color": "transparent",
+        "button_color": ["#FFB7C5", "#ff7bd5"],
+        "button_hover_color": ["#FFA4B6", "#ff52cb"],
+        "border_width": 0,
+        "corner_radius": 4
+    },
+    "CTkProgressBar": {
+        "fg_color": ["#FFF5F7", "#1E1E1E"],
+        "progress_color": ["#FFB7C5", "#ff7bd5"],
+        "border_width": 0,
+        "corner_radius": 4
+    },
+    "CTkSlider": {
+        "fg_color": ["#FFF5F7", "#1E1E1E"],
+        "button_color": ["#FFB7C5", "#ff7bd5"],
+        "button_hover_color": ["#FFA4B6", "#ff52cb"],
+        "border_width": 0,
+        "corner_radius": 4
+    },
+    "CTkSwitch": {
+        "fg_color": ["#FFF5F7", "#1E1E1E"],
+        "progress_color": ["#FFB7C5", "#ff7bd5"],
+        "button_color": ["#FFFFFF", "#FFFFFF"],
+        "button_hover_color": ["#FFF0F5", "#FFF0F5"],
+        "text_color": ["#D87093", "#FFFFFF"],
+        "border_width": 0,
+        "corner_radius": 1000
+    },
+    "CTkCheckBox": {
+        "fg_color": ["#FFB7C5", "#ff7bd5"],
+        "border_color": ["#FFB7C5", "#ff7bd5"],
+        "hover_color": ["#FFA4B6", "#ff52cb"],
+        "text_color": ["#D87093", "#FFFFFF"],
+        "border_width": 2,
+        "corner_radius": 4
+    },
+    "CTkRadioButton": {
+        "fg_color": ["#FFB7C5", "#ff7bd5"],
+        "border_color": ["#FFB7C5", "#ff7bd5"],
+        "hover_color": ["#FFA4B6", "#ff52cb"],
+        "text_color": ["#D87093", "#FFFFFF"],
+        "border_width": 2,
+        "corner_radius": 1000
+    },
+    "CTkOptionMenu": {
+        "fg_color": ["#FFB7C5", "#ff7bd5"],
+        "button_color": ["#FFB7C5", "#ff7bd5"],
+        "button_hover_color": ["#FFA4B6", "#ff52cb"],
+        "text_color": ["#FFFFFF", "#FFFFFF"],
+        "text_color_disabled": ["#A0A0A0", "#707070"],
+        "corner_radius": 6
+    },
+    "CTkComboBox": {
+        "fg_color": ["#FFFFFF", "#1E1E1E"],
+        "border_color": ["#FFB7C5", "#ff7bd5"],
+        "button_color": ["#FFB7C5", "#ff7bd5"],
+        "button_hover_color": ["#FFA4B6", "#ff52cb"],
+        "text_color": ["#000000", "#FFFFFF"],
+        "placeholder_text_color": ["#A0A0A0", "#707070"],
+        "border_width": 2,
+        "corner_radius": 6
+    },
+    "CTkSegmentedButton": {
+        "fg_color": ["#FFF5F7", "#1E1E1E"],
+        "selected_color": ["#FFB7C5", "#ff7bd5"],
+        "selected_hover_color": ["#FFA4B6", "#ff52cb"],
+        "unselected_color": ["#FFF5F7", "#1E1E1E"],
+        "unselected_hover_color": ["#FFD1DC", "#303030"],
+        "text_color": ["#D87093", "#FFFFFF"],
+        "text_color_disabled": ["#A0A0A0", "#707070"],
+        "corner_radius": 6
+    },
+    "CTkTextbox": {
+        "fg_color": ["#FFFFFF", "#1E1E1E"],
+        "border_color": ["#FFB7C5", "#ff7bd5"],
+        "text_color": ["#000000", "#FFFFFF"],
+        "border_width": 2,
+        "corner_radius": 6
+    },
+    "DropdownMenu": {
+        "fg_color": ["#FFF5F7", "#1E1E1E"],
+        "hover_color": ["#FFD1DC", "#303030"],
+        "text_color": ["#D87093", "#FFFFFF"]
+    }
+}
