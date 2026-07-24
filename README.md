@@ -23,26 +23,27 @@ AireadFsEvaluator/
 │   ├── constants.py              # 定数定義
 │   ├── eval/                     # 評価モジュール
 │   │   └── csv4db_evaluator.py   # CSV比較のコアロジック
-│   └── utils/                    # ユーティリティ
-│       ├── path_utils.py         # パス操作
-│       └── cmd_executer.py       # コマンド実行
-├── tests/                        # テストコード
-│   ├── conftest.py               # pytestフィクスチャ
-│   ├── test_path_utils.py        # パスユーティリティのテスト
-│   ├── test_csv4db_evaluator.py  # 評価クラスのユニットテスト
-│   └── test_main.py              # mainモジュールのテスト
+│   ├── gui/                      # GUIモジュール
+│   │   ├── gui.py                # アプリ画面＆ブラウザ自動起動
+│   │   └── pink_theme.json       # カラーテーマ設定
+│   └── utils/                    # ユーティリティ（cmd_executer, fileutils 等）
+│
+├── tests/                        # テストコード類
+│   ├── conftest.py
+│   └── test_*.py                 # 各種ユニットテスト
+│
 ├── data/                         # データディレクトリ
-│   ├── ground_truth/             # 正解データディレクトリ
-│   │   └── fs/                   # 正解データ
-│   └── row/                      # 生データ・AIRead一式
-│       ├── _tessdata/            # AIReadの頭脳データ
-│       ├── bspl/                 # AIRead設定
-│       ├── fal/                  # AIRead設定
-│       └── fs/                   # AIReadの決算書の出力先
-├── results/                      # 評価結果出力先
-├── pytest.ini                    # pytest設定
-├── requirements-test.txt         # テスト依存パッケージ
-└── README.md                     # このファイル
+│   ├── ground_truth/             # 正解マスタデータ置き場
+│   │   └── fs/                   # マスタCSV
+│   └── row/                      # AIRead処理エリア
+│       └── fs/                   # 解析対象のPDF
+│
+├── results/                      # 実行時に自動作成される評価結果出力先
+│   └── fs/                       # 実行結果（summary_report.csv や個別HTML等）
+│
+├── pytest.ini
+├── requirements-test.txt
+└── README.md
 ```
 
 ## Getting Started
