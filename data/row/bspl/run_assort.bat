@@ -9,7 +9,7 @@ if exist logs ( rd /s /q logs )
 if exist output ( rd /s /q output )
 if exist success ( rd /s /q success )
 
-echo D | xcopy /e input input_work
+xcopy /e /i /y input input_work
 
 "%AIREAD_JAVA%/java" -Xmx8192m -Dhttps.protocols=TLSv1.2 -classpath "%CLASSPATH%" %MAIN_CLASS_NAME% -s ".\AIRead_setting.ini" -A "AIRead_conf\ClassifyDir"
 

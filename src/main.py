@@ -40,7 +40,6 @@ ARG_DEFS = [
         "flags": ["-p", "--prediction_dir"],
         "kwargs": {"type": Path, "help": "Output dir of AIRead. If -c is not specified, this option is required."}
     },
-
 ]
 
 
@@ -52,11 +51,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_config(config_file: Path) -> dict:
-    # 絶対パスに強制解決
-    absolute_path = config_file.resolve()
-    if not absolute_path.exists():
-        raise FileNotFoundError(f"Config file not found at: {absolute_path}")
-    
+    if not config_file.exists():
+        raise FileNotFoundError("Config file not found")
+
     with open(config_file, "rb") as f:
         return tomllib.load(f)
 
@@ -65,24 +62,18 @@ def export_whole_summary_report():
     agged_summarys = []
     for path in RESULTS_BASE_DIR.glob("*/summary_report.csv"):
         df = pandas.read_csv(path, encoding=fileutils.detect_encoding(path))
-        # 数値列はすべて合計し、精度列は合計後に項目正解数/項目数*100で再計算する
         numeric_cols = df.select_dtypes(include='number').columns
         accuracy_cols = [col for col in numeric_cols if 'accuracy' in col.lower() or '精度' in col]
         sum_cols = [col for col in numeric_cols if col not in accuracy_cols]
-        # 合計値の算出
         agg_df = pandas.DataFrame([df[sum_cols].sum()])
-        # 合計値の列は整数型(int)に変換して .0 を消す
         for col in sum_cols:
             agg_df[col] = agg_df[col].astype(int)
-        # 精度列は項目正解数/項目数*100で再計算（小数点第2位で丸める）
         total_match = df['項目正解数'].sum() if '項目正解数' in df.columns else 0
         total_items = df['項目数'].sum() if '項目数' in df.columns else 0
         accuracy_value = round((total_match / total_items * 100), 2) if total_items > 0 else 0
         for col in accuracy_cols:
             agg_df[col] = accuracy_value
-        # 列順を元のサマリーに合わせる
         agg_df = agg_df[[col for col in numeric_cols if col in agg_df.columns]]
-        # 帳票種別の列を先頭に追加
         agg_df.insert(0, "帳票種別", path.parent.name)
         agged_summarys.append(agg_df)
 
@@ -99,13 +90,11 @@ def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s: %(message)s')
 
     if args.config_file is not None:
-        # configファイルから設定を読み込んで精度評価
         logging.info(f"Loading config from: {args.config_file}")
 
         config = load_config(args.config_file)
 
         for section, content in config.items():
-            # 必須パラメータのチェック
             if not content.get("ground_truth_dir"):
                 logging.warning(f"Ground truth directory is required in section '{section}'.ground_truth_dir")
                 continue
@@ -117,22 +106,15 @@ def main():
             ground_truth_dir: Path = Path(content.get("ground_truth_dir"))
             prediction_dir: Path = Path(content.get("prediction_dir"))
 
-            # 引数で指定されたディレクトリを検証（正解データフォルダ）
             pathutils.validate_dir(ground_truth_dir)
-
-            # resultsディレクトリがなければ作成
             pathutils.setup_dir(RESULTS_BASE_DIR)
 
-            # バッチファイルの指定があればAIRead実行
             if airead_batch_file is not None:
                 pathutils.validate_file(airead_batch_file)
                 cmd_executer.exec_batch(airead_batch_file, cwd=airead_batch_file.parent, popen_encoding='utf-8', stdout_encoding='utf-8')
 
-            # 引数で指定されたディレクトリを検証（比較対象データフォルダ）
-            # ※ prediction_dirはAIRead実行時に作成される可能性があるのでここでチェックする
             pathutils.validate_dir(prediction_dir)
 
-            # 精度検証
             if section is not None:
                 evaluator = Csv4dbEvaluator(
                     session=section,
@@ -142,10 +124,8 @@ def main():
                 )
                 evaluator.compare_with_pandas()
     else:
-        # args.config_file以外のオプションから設定を読み込んで精度評価
         logging.info("Using command-line arguments")
 
-        # コマンドオプションのチェック
         if not args.ground_truth_dir:
             raise ValueError("Ground truth directory is required when not using a config file.")
         if not args.prediction_dir:
@@ -156,22 +136,15 @@ def main():
         prediction_dir = args.prediction_dir
         session_type = args.session_type
 
-        # 引数で指定されたディレクトリを検証（正解データフォルダ）
         pathutils.validate_dir(ground_truth_dir)
-
-        # resultsディレクトリがなければ作成
         pathutils.setup_dir(RESULTS_BASE_DIR)
 
-        # バッチファイルの指定があればAIRead実行
         if airead_batch_file is not None:
             pathutils.validate_file(airead_batch_file)
             cmd_executer.exec_batch(airead_batch_file, cwd=airead_batch_file.parent, popen_encoding='utf-8', stdout_encoding='utf-8')
 
-        # 引数で指定されたディレクトリを検証（比較対象データフォルダ）
-        # ※ prediction_dirはAIRead実行時に作成される可能性があるのでここでチェックする
         pathutils.validate_dir(prediction_dir)
 
-        # 精度検証
         if session_type is not None:
             evaluator = Csv4dbEvaluator(
                 session=session_type,
@@ -181,10 +154,9 @@ def main():
             )
             evaluator.compare_with_pandas()
 
-
-    # 全体サマリの出力
     export_whole_summary_report()
 
 
 if __name__ == "__main__":
     main()
+    

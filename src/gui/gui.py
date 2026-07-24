@@ -1,7 +1,11 @@
-import os
 import csv
+import os
 import webbrowser
 import customtkinter as ctk
+
+# local/project imports
+from src.main import main as run_evaluation
+from src.utils import pathutils
 
 # 画面全体ダークモード
 ctk.set_appearance_mode("dark")
@@ -14,9 +18,6 @@ app = ctk.CTk()
 app.title("Airead 比較結果")
 app.geometry("450x350")
 
-# ==========================================
-# テキスト表示エリア
-# ==========================================
 label_text = ctk.CTkLabel(
     app, 
     text="読込完了", 
@@ -24,34 +25,64 @@ label_text = ctk.CTkLabel(
 )
 label_text.pack(pady=60)
 
-# ==========================================
-# CSVを読み込んで「Summary」HTMLを生成して開く
-# ==========================================
+
 def button_click():
+    label_text.configure(text="評価処理を実行中...")
+    app.update()  # 画面表示を更新
+
+    # ----------------------------------------------------
+    # 1. 丸付けロジック（main.py）を呼び出して最新のresultsを生成
+    # ----------------------------------------------------
+    project_root = pathutils.get_project_root_dir()
+    
+    import sys
+    config_path = str(project_root / ".azure-pipelines" / "config.toml")
+    
+    sys.argv = [
+        "main.py",
+        "-c", config_path
+    ]    
+    try:
+        run_evaluation()
+    except Exception as e:
+        print(f"⚠️ 評価実行時の注意: {e}")
+
     label_text.configure(text="Summaryを表示中...")
+    app.update()
+
+    # ----------------------------------------------------
+    # 2. 生成された個別比較CSV (full_comparison_*.csv) を探索
+    # ----------------------------------------------------
+    # 正しいフォルダパス: "individual reports" (スペース区切り)
+    results_dir = project_root / "results" / "fs" / "individual reports"
     
-    # 1. 読み込むCSVのパスを解決する
-    # ※プロジェクトルート直下の results/whole_summary_report.csv を狙い撃ち！
-    project_root = os.path.dirname(os.path.dirname(current_dir))
-    csv_path = os.path.join(project_root, "results", "whole_summary_report.csv")
-    
-    # CSVからHTMLのテーブル行（tr）を自動生成する
+    target_csv = None
+    if results_dir.exists():
+        for root, dirs, files in os.walk(results_dir):
+            for file in files:
+                if "full_comparison" in file and file.endswith(".csv"):
+                    target_csv = os.path.join(root, file)
+                    break
+
     table_rows_html = ""
     total_count = 0
     passed_count = 0
-    
-    if os.path.exists(csv_path):
-        with open(csv_path, "r", encoding="utf-8") as f:
+
+    if target_csv and os.path.exists(target_csv):
+        with open(target_csv, "r", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
             
             for i, row in enumerate(reader, 1):
-                # CSVのカラム名に合わせて取得
-                correct = row.get("correct", row.get("正解", "不明"))
-                recognized = row.get("recognized", row.get("読み取り", "不明"))
-                result = row.get("result", row.get("結果", "✖"))
+                item_gt = row.get("c0_gt", row.get("項目正解", "不明"))
+                item_pd = row.get("c0_pd", row.get("項目読み取り", "不明"))
+                amt_gt = row.get("c1_gt", "")
+                amt_pd = row.get("c1_pd", "")
                 
-                # 結果に応じてクラス（色）を変える
-                if result in ["●", "○", "OK", "Passed", "1"]:
+                correct_display = f"{item_gt} ({amt_gt})" if amt_gt else item_gt
+                recognized_display = f"{item_pd} ({amt_pd})" if amt_pd else item_pd
+                
+                accuracy_val = str(row.get("accuracy", row.get("一致", "0")))
+                if accuracy_val in ["100", "True", "true", "1"] or (item_gt == item_pd and amt_gt == amt_pd):
                     result_class = "result-ok"
                     result_text = "●"
                     passed_count += 1
@@ -61,37 +92,36 @@ def button_click():
                 
                 total_count += 1
                 
-                # HTMLの1行分を組み立てるのん！
                 table_rows_html += f"""
                 <tr>
                     <td>{i}</td>
-                    <td>{correct}</td>
-                    <td>{recognized}</td>
+                    <td>{correct_display}</td>
+                    <td>{recognized_display}</td>
                     <td class="{result_class}">{result_text}</td>
                 </tr>
                 """
     else:
-        # CSVが見つからない場合のフォールバック（テスト用ダミーデータ）
         table_rows_html = """
-        <tr><td>1</td><td>宇都宮</td><td>宇都宮</td><td class="result-ok">●</td></tr>
-        <tr><td>2</td><td>餃子</td><td>校舎</td><td class="result-ng">✖</td></tr>
+        <tr><td>1</td><td>データ読み込み中</td><td>データ読み込み中</td><td class="result-ng">✖</td></tr>
         """
-        total_count = 2
-        passed_count = 1
+        total_count = 1
+        passed_count = 0
 
-    # 正解率を計算
     accuracy = (passed_count / total_count * 100) if total_count > 0 else 0
     
-    # 2. 生成するHTMLファイルのパス（src/gui/result.html）
-    html_path = os.path.join(current_dir, "result.html")
+    # ----------------------------------------------------
+    # 3. HTMLテンプレートを作成してブラウザ起動
+    # ----------------------------------------------------
+    output_html_dir = project_root / "results" / "fs"
+    output_html_dir.mkdir(parents=True, exist_ok=True)
+    html_path = str(output_html_dir / "gui_report.html")
     
-    # 3. HTMLテンプレート
     html_content = f"""<!DOCTYPE html>
 <html lang="ja">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Airead Evaluation Summary 🌸</title>
+    <title>Airead Evaluation Summary</title>
     <style>
         body {{
             background-color: #121212;
@@ -213,14 +243,12 @@ def button_click():
 </html>
 """
     
-    # HTMLファイルを出力
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html_content)
         
-    # ブラウザで自動起動
     webbrowser.open(html_path)
 
-# テスト実行ボタン
+
 button = ctk.CTkButton(
     app, 
     text="テスト実行", 
@@ -229,5 +257,4 @@ button = ctk.CTkButton(
 )
 button.pack(pady=20)
 
-# 画面を起動する
 app.mainloop()

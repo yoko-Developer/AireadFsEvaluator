@@ -657,3 +657,4 @@ class Csv4dbEvaluator:
         """不一致行のみを抽出する（並び順は抽出元の自然な状態を維持する）"""
         # ソート処理を削除し、DataFrameの元の綺麗な並び順を維持したまま抽出する
         return df[(df['accuracy'] < 100) | (df['row_presence'] != 'both')].copy()
+    

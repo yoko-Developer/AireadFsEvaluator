@@ -37,7 +37,7 @@ def convert_to_raw_csv(tsv_folder, output_csv_path):
     raw_rows = []
     
     if not os.path.exists(tsv_folder):
-        print(f"⚠️ TSVフォルダが見つからない: {tsv_folder}")
+        print(f"TSVフォルダが見つからない: {tsv_folder}")
         return
 
     for filename in sorted(os.listdir(tsv_folder)):
@@ -82,7 +82,7 @@ def convert_to_raw_csv(tsv_folder, output_csv_path):
         writer.writeheader()
         writer.writerows(raw_rows)
         
-    print(f"✨ 生データCSVを作成！ ➡️ {output_csv_path}")
+    print(f"生データCSVを作成 ➡️ {output_csv_path}")
 
 if __name__ == "__main__":
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -93,3 +93,4 @@ if __name__ == "__main__":
     output_path = os.path.join(project_root, "results", "detail_raw.csv")
     
     convert_to_raw_csv(tsv_dir, output_path)
+    
