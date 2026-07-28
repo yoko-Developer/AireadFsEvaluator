@@ -1,0 +1,7 @@
+regex	replace_char
+[CDOUcdou]	0
+[IJLijl|)]	1
+G	6
+[BS日]	8
+^[FY]	T
+.(f)	1

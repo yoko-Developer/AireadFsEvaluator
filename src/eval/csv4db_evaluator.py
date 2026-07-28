@@ -408,9 +408,9 @@ class Csv4dbEvaluator:
             merge_status = row.get('row_presence', 'both')
 
             for col in ordered_cols:
-                gt_val = str(row.get(f"{col}_gt", "")).strip()
-                pd_val = str(row.get(f"{col}_pd", "")).strip()
-
+                gt_val = str(row.get(f"{col}_gt", "")).replace(' ', '').replace(' ', '').strip()
+                pd_val = str(row.get(f"{col}_pd", "")).replace(' ', '').replace(' ', '').strip()
+                
                 # 一致しているセルは出力しない（エラー箇所のみ抽出）
                 if gt_val == pd_val:
                     continue
@@ -608,9 +608,9 @@ class Csv4dbEvaluator:
     # ==========================================
     @staticmethod
     def _normalize_text(text: str) -> str:
-        """比較のノイズとなる記号を除去"""
-        return re.sub(r'[【】\(\)（）※\*＊,、\s\t]', '', str(text))
-
+        """比較のノイズとなる記号やスペースを除去"""
+        text_clean = str(text).replace(' ', '').replace(' ', '')
+        return re.sub(r'[【】\(\)（）※\*＊\s\t,、]', '', text_clean)
 
     @staticmethod
     def _get_similarity(text1: str, text2: str) -> float:
@@ -641,9 +641,13 @@ class Csv4dbEvaluator:
             if pd_col in row.index:
                 # 値の取得
                 pd_val = str(row[pd_col]) if pandas.notna(row[pd_col]) else ""
-
-                # 一致判定（文字列として比較）
-                if gt_val == pd_val:
+                
+                # ノイズ（カンマやカッコ、スペースなど）を削除
+                gt_norm = Csv4dbEvaluator._normalize_text(gt_val)
+                pd_norm = Csv4dbEvaluator._normalize_text(pd_val)
+                
+                # 🌟 正規化後の文字列（gt_norm, pd_norm）同士で一致判定！
+                if gt_norm == pd_norm:
                     match_count += 1
 
         accuracy = (match_count / item_count) * 100 if item_count > 0 else 0
@@ -651,7 +655,6 @@ class Csv4dbEvaluator:
 
         # 3つの値をセットで返す
         return pandas.Series([item_count, match_count, accuracy])
-
 
     def _extract_differences(self, df: pandas.DataFrame) -> pandas.DataFrame:
         """不一致行のみを抽出する（並び順は抽出元の自然な状態を維持する）"""
