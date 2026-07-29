@@ -18,31 +18,37 @@ AIReadで読み取った決算書（Financial Statements）のOCR精度を自動
 
 ```
 AireadFsEvaluator/
-├── src/                          # ソースコード
-│   ├── main.py                   # メインエントリーポイント
-│   ├── constants.py              # 定数定義
-│   ├── eval/                     # 評価モジュール
-│   │   └── csv4db_evaluator.py   # CSV比較のコアロジック
-│   └── utils/                    # ユーティリティ
-│       ├── path_utils.py         # パス操作
-│       └── cmd_executer.py       # コマンド実行
-├── tests/                        # テストコード
-│   ├── conftest.py               # pytestフィクスチャ
-│   ├── test_path_utils.py        # パスユーティリティのテスト
-│   ├── test_csv4db_evaluator.py  # 評価クラスのユニットテスト
-│   └── test_main.py              # mainモジュールのテスト
-├── data/                         # データディレクトリ
-│   ├── ground_truth/             # 正解データディレクトリ
-│   │   └── fs/                   # 正解データ
-│   └── row/                      # 生データ・AIRead一式
-│       ├── _tessdata/            # AIReadの頭脳データ
-│       ├── bspl/                 # AIRead設定
-│       ├── fal/                  # AIRead設定
-│       └── fs/                   # AIReadの決算書の出力先
-├── results/                      # 評価結果出力先
-├── pytest.ini                    # pytest設定
-├── requirements-test.txt         # テスト依存パッケージ
-└── README.md                     # このファイル
+├── src/
+│   ├── main.py                    # メインエントリーポイント
+│   ├── constants.py               # 定数定義
+│   ├── eval/                      # 評価モジュール
+│   │   └── csv4db_evaluator.py    # CSV比較のコアロジック
+│   ├── gui/                       # GUIモジュール
+│   │   ├── gui.py                
+│   │   └── pink_theme.json       
+│   └── utils/                     # ユーティリティ（cmd_executer, fileutils 等）
+│
+├── tests/                         # テストコード類
+│   ├── conftest.py
+│   └── test_*.py                  # 各種ユニットテスト
+│
+├── data/                          # データディレクトリ
+│   ├── ground_truth/              # 正解マスタデータ置き場
+│   │   └── fs/                    # マスタCSV
+│   └── row/                    
+│       └── fs/                    # AIRead設定
+│           ├── option.csv
+│           ├── run_assort.bat
+│           ├── AIRead_setting.ini
+│           ├── AIRead_conf/
+│           └── output/　　　　　   # 出力csv
+│
+├── results/                       # 評価結果
+│   └── fs/                       
+│
+├── pytest.ini
+├── requirements-test.txt
+└── README.md
 ```
 
 ## Getting Started
@@ -79,20 +85,20 @@ ground_truth_dir = "./data/ground_truth/fs"
 
 ## 使用方法
 1. データの配置
-- AIReadの出力結果 (CSV) を ./data/row/fs/ に配置します。
-- 人間が作成した正解データ (CSV) を ./data/ground_truth/fs/ に配置します。
+- 読取りファイル (pdf) を ./data/row/fs/nput に配置します。
+- マスタデータ (CSV) を ./data/ground_truth/fs/ に配置します。
 
     ※比較を行うため、双方のファイル名は完全に一致させてください。
 
-2. 評価の実行
+1. 評価の実行
    
-   設定ファイルを指定し、セッションタイプを fs に指定して実行します。
+   実行コマンド
 
    ```PowerShell
-   python -m src.main -c config.toml -s fs
+   python -m src.gui.gui
    ```
 
-3. 出力結果
+2. 出力結果
 
 実行後、results/fs/ ディレクトリに以下のレポートが自動生成されます。
 
