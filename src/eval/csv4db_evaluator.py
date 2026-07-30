@@ -195,7 +195,7 @@ class Csv4dbEvaluator:
                         "accuracy": acc,
                         "BS_acc": bs_acc,
                         "PL_acc": pl_acc,
-                        "販管費明細_acc": sg_acc,
+                        "販管費_acc": sg_acc,
                         "株主資本_acc": ss_acc,
                         "製造原価_acc": seizo_acc
                     })

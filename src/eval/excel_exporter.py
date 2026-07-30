@@ -12,10 +12,10 @@ class KessanExcelExporter:
     """
 
     # 🎨 スタイル定義
-    PASTEL_PINK_FILL = PatternFill(start_color="F875DD", end_color="F875DD", fill_type="solid")  # ヘッダー
-    LIGHT_BLUE_FILL = PatternFill(start_color="E1F5FE", end_color="E1F5FE", fill_type="solid")   # 最下行
-    ALERT_FILL = PatternFill(start_color="FF6EC7", end_color="FF6EC7", fill_type="solid")        # エラー
-    PAGE_TITLE_FILL = PatternFill(start_color="F0C0FE", end_color="F0C0FE", fill_type="solid")   # ページ見出し
+    PASTEL_PINK_FILL = PatternFill(start_color="F875DD", end_color="F875DD", fill_type="solid")  # ヘッダー用ピンク
+    LIGHT_BLUE_FILL = PatternFill(start_color="E1F5FE", end_color="E1F5FE", fill_type="solid")   # 最下行用薄い水色
+    ALERT_FILL = PatternFill(start_color="FF6EC7", end_color="FF6EC7", fill_type="solid")       # エラー用濃いピンク
+    PAGE_TITLE_FILL = PatternFill(start_color="F0C0FE", end_color="F0C0FE", fill_type="solid")  # ページ見出し用
 
     # 🔤 フォント
     TITLE_FONT = Font(name="Yu Gothic", size=14, bold=True, color="000000")
@@ -25,6 +25,7 @@ class KessanExcelExporter:
     PAGE_TITLE_FONT = Font(name="Yu Gothic", size=10, bold=True, color="4A148C")
     ALERT_FONT = Font(name="Yu Gothic", size=10, bold=True, color="FFFFFF") # エラー時白文字
 
+    # 🔲 罫線（枠線）定義
     THIN_BORDER = Border(
         left=Side(style='thin', color='B0BEC5'),
         right=Side(style='thin', color='B0BEC5'),
@@ -58,7 +59,9 @@ class KessanExcelExporter:
         # シート1: 📊 決算5表 マトリックス集計表
         # -------------------------------------------------------------
         ws_matrix = wb.create_sheet(title="マトリックス表")
-        ws_matrix.views.sheetView[0].showGridLines = True
+        
+        # ✨【修正】背景の標準目盛り線を非表示（False）にする！
+        ws_matrix.views.sheetView[0].showGridLines = False
 
         ws_matrix.cell(row=1, column=1, value="決算5表 精度評価マトリックスレポート").font = cls.TITLE_FONT
 
@@ -122,7 +125,6 @@ class KessanExcelExporter:
                 else:
                     c.value = str(status_val)
                 
-                # 🌟 上下行で統一感が出るように【センター揃え】にする！
                 c.alignment = Alignment(horizontal="center", vertical="center")
 
             for col in range(1, len(headers) + 1):
@@ -178,30 +180,57 @@ class KessanExcelExporter:
             ws_matrix.column_dimensions[c_letter].width = 16
 
         # -------------------------------------------------------------
-        # シート2以降: 📄 詳細シート（ページごとの小計付き）
+        # シート2以降: 📄 詳細シート
         # -------------------------------------------------------------
         for sheet_name, page_df_list in detail_dfs:
             safe_title = re.sub(r'[\\/*?:\[\]]', '', sheet_name)[:28]
             ws_detail = wb.create_sheet(title=safe_title)
-            ws_detail.views.sheetView[0].showGridLines = True
-
-            detail_headers = ["No", "科目 (正解)", "科目 (読み取り)", "科目判定", "金額 (正解)", "金額 (読み取り)", "金額判定", "行正解率"]
             
-            for col_idx, h_text in enumerate(detail_headers, start=1):
-                cell = ws_detail.cell(row=1, column=col_idx, value=h_text)
-                cell.fill = cls.PASTEL_PINK_FILL
-                cell.font = cls.HEADER_FONT
-                cell.alignment = Alignment(horizontal="center", vertical="center")
-                cell.border = cls.THIN_BORDER
+            # ✨【修正】背景の標準目盛り線を非表示（False）にする！
+            ws_detail.views.sheetView[0].showGridLines = False
 
-            ws_detail.row_dimensions[1].height = 24
+            ws_detail.row_dimensions[1].height = 22
+            ws_detail.row_dimensions[2].height = 22
 
-            current_row = 2
+            # 1行目・2行目の縦結合
+            ws_detail.merge_cells("A1:A2")
+            ws_detail.cell(row=1, column=1, value="No")
+
+            ws_detail.merge_cells("H1:H2")
+            ws_detail.cell(row=1, column=8, value="正解率")
+
+            # 1行目の横結合
+            ws_detail.merge_cells("B1:D1")
+            ws_detail.cell(row=1, column=2, value="科目")
+
+            ws_detail.merge_cells("E1:G1")
+            ws_detail.cell(row=1, column=5, value="金額")
+
+            # 2行目のサブヘッダー
+            ws_detail.cell(row=2, column=2, value="マスタ")
+            ws_detail.cell(row=2, column=3, value="読み取り")
+            ws_detail.cell(row=2, column=4, value="判定")
+
+            ws_detail.cell(row=2, column=5, value="マスタ")
+            ws_detail.cell(row=2, column=6, value="読み取り")
+            ws_detail.cell(row=2, column=7, value="判定")
+
+            # 全ヘッダーセル（1行目・2行目）の装飾 ＆ 罫線一括適用
+            for r in [1, 2]:
+                for c in range(1, 9):
+                    cell = ws_detail.cell(row=r, column=c)
+                    cell.fill = cls.PASTEL_PINK_FILL
+                    cell.font = cls.HEADER_FONT
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                    cell.border = cls.THIN_BORDER
+
+            current_row = 3  # データ開始行
 
             for p_title, df_page in page_df_list:
                 page_items = 0
                 page_matches = 0
 
+                # ページタイトル行（紫枠）
                 title_row_idx = current_row
                 ws_detail.merge_cells(start_row=title_row_idx, start_column=1, end_row=title_row_idx, end_column=8)
                 ws_detail.row_dimensions[title_row_idx].height = 22
@@ -229,6 +258,7 @@ class KessanExcelExporter:
                     page_matches += matched_cells
                     row_acc = (matched_cells / total_cells) if total_cells > 0 else 1.0
 
+                    # 各列の値と配置のセット
                     ws_detail.cell(row=current_row, column=1, value=item_no).alignment = Alignment(horizontal="center", vertical="center")
                     ws_detail.cell(row=current_row, column=2, value=c0_gt).alignment = Alignment(vertical="center")
                     ws_detail.cell(row=current_row, column=3, value=c0_pd).alignment = Alignment(vertical="center")
@@ -252,6 +282,7 @@ class KessanExcelExporter:
                     acc_c.number_format = '0.0%'
                     acc_c.alignment = Alignment(horizontal="right", vertical="center")
 
+                    # 格子枠線（THIN_BORDER）を自動適用
                     for col_i in range(1, 9):
                         c = ws_detail.cell(row=current_row, column=col_i)
                         if col_i not in [4, 7] or (col_i == 4 and c0_match) or (col_i == 7 and c1_match):
@@ -261,6 +292,7 @@ class KessanExcelExporter:
                     current_row += 1
                     item_no += 1
 
+                # ページタイトルの見出しセル装飾
                 p_acc_val = (page_matches / page_items * 100) if page_items > 0 else 100.0
                 t_cell = ws_detail.cell(row=title_row_idx, column=1, value=f"📄 {p_title}   【項目数: {page_items} | 正解数: {page_matches} | ページ正解率: {p_acc_val:.1f}%】")
                 t_cell.fill = cls.PAGE_TITLE_FILL
@@ -269,6 +301,7 @@ class KessanExcelExporter:
                 for c_idx in range(1, 9):
                     ws_detail.cell(row=title_row_idx, column=c_idx).border = cls.THIN_BORDER
 
+            # 列幅の調整
             ws_detail.column_dimensions['A'].width = 6
             ws_detail.column_dimensions['B'].width = 28
             ws_detail.column_dimensions['C'].width = 28
