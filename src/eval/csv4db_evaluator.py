@@ -11,12 +11,12 @@ import pandas
 # local
 from src import constants as const
 from src.utils import fileutils 
-
+from src.eval.excel_exporter import KessanExcelExporter
 
 class Csv4dbEvaluator:
     """
     CSV4DB形式で出力したAIReadの結果ファイルと正解データファイル(Ground Truth)を比較し、
-    精度指標の算出および差分レポート(CSV/HTML)を出力するクラス。
+    精度指標の算出および差分レポート(CSV/HTML)を出力するクラス
     """
 
     def __init__(self, session: str, prediction_dir: Path, ground_truth_dir: Path, results_base_dir: Path) -> None:
@@ -71,7 +71,7 @@ class Csv4dbEvaluator:
         # 統計集計用に (ファイル名, 統合データフレーム) のリストを保持
         evaluation_results: List[Tuple[str, pandas.DataFrame]] = []
 
-        logging.info(f"🚀 {num_of_file} 件の精度解析を開始します...")
+        logging.info(f"🚀 {num_of_file} 件の精度解析を開始")
         logging.info(f"📁 出力先セッション: {self.session_dir}")
 
         for i, pd_file in enumerate(pd_files, start=1):
@@ -116,10 +116,102 @@ class Csv4dbEvaluator:
         # サマリーレポートの生成
         if evaluation_results:
             self._save_summary_report(evaluation_results)
+
+            try:
+                base_excel_path = self.session_dir / "kessan_matrix_report.xlsx"
+                excel_output_path = base_excel_path
+                counter = 1
+                while True:
+                    try:
+                        if excel_output_path.exists():
+                            with open(excel_output_path, "a"): pass
+                        break
+                    except IOError:
+                        excel_output_path = self.session_dir / f"kessan_matrix_report_{counter}.xlsx"
+                        counter += 1
+
+                pdf_groups = {}
+                for file_name, df in evaluation_results:
+                    base_pdf_name = re.sub(r'_\d+(_detail)?\.csv$', '', file_name)
+                    if base_pdf_name not in pdf_groups:
+                        pdf_groups[base_pdf_name] = []
+                    pdf_groups[base_pdf_name].append((file_name, df))
+
+                summary_list = []
+                detail_dfs = []
+
+                for pdf_name, page_list in pdf_groups.items():
+                    total_pages = 0
+                    total_items = 0
+                    total_matches = 0
+                    page_df_list = []
+
+                    bs_acc = "-"
+                    pl_acc = "-"
+                    sg_acc = "-"
+                    ss_acc = "-"
+                    seizo_acc = "-"
+
+                    for page_file_name, df in page_list:
+                        # 明細データ(_detail)または比較DataFrame
+                        if "_detail" in page_file_name or "c0_gt" in df.columns:
+                            total_pages += 1
+                            item_sum = df['item_count'].sum() if 'item_count' in df.columns else len(df)
+                            match_sum = df['match_count'].sum() if 'match_count' in df.columns else 0
+
+                            total_items += item_sum
+                            total_matches += match_sum
+
+                            p_acc_num = round((match_sum / item_sum * 100), 1) if item_sum > 0 else 100.0
+
+                            # ページ番号（_0_, _1_, _2_, _3_）による帳票判定
+                            if re.search(r'_0(_detail)?\.csv$', page_file_name):
+                                p_title = "貸借対照表 (BS)"
+                                bs_acc = p_acc_num
+                            elif re.search(r'_1(_detail)?\.csv$', page_file_name):
+                                p_title = "損益計算書 (PL)"
+                                pl_acc = p_acc_num
+                            elif re.search(r'_2(_detail)?\.csv$', page_file_name):
+                                p_title = "販売費及び一般管理費明細書"
+                                sg_acc = p_acc_num  # ★ _2.csv は絶対に販管費！これで87.3%が入る！
+                            elif re.search(r'_3(_detail)?\.csv$', page_file_name):
+                                p_title = "株主資本等変動計算書"
+                                ss_acc = p_acc_num
+                            elif "製造" in page_file_name or "原価" in page_file_name:
+                                p_title = "製造原価明細書"
+                                seizo_acc = p_acc_num
+                            else:
+                                p_title = f"決算書 ({page_file_name})"
+
+                            page_df_list.append((p_title, df))
+
+                    acc = round((total_matches / total_items * 100), 2) if total_items > 0 else 0.0
+
+                    summary_list.append({
+                        "filename": pdf_name,
+                        "total_pages": total_pages,
+                        "total_items": total_items,
+                        "total_matches": total_matches,
+                        "accuracy": acc,
+                        "BS_acc": bs_acc,
+                        "PL_acc": pl_acc,
+                        "販管費明細_acc": sg_acc,
+                        "株主資本_acc": ss_acc,
+                        "製造原価_acc": seizo_acc
+                    })
+
+                    if page_df_list:
+                        detail_dfs.append((pdf_name, page_df_list))
+
+                KessanExcelExporter.export_kessan_report(excel_output_path, summary_list, detail_dfs)
+                logging.info(f"✨ 決算5表マトリックスExcelを出力しました: {excel_output_path}")
+
+            except Exception as e:
+                logging.error(f"❌ Excel出力中にエラーが発生しました: {e}")
+
         else:
-            logging.warning("❌ 評価対象データが見つかりませんでした。")
-
-
+            logging.warning("❌ 評価対象データが見つかりません。")
+            
     # ==========================================
     # CSV読み込み
     # ==========================================
@@ -168,7 +260,7 @@ class Csv4dbEvaluator:
         # --- PD側の列名書き換え（直前のcXXを引き継いでネーミングする） ---
         pd_col_new_names = []
         last_matched_col = "col_top"  # 紐付く前にいきなり過剰列が出た場合用
-        extra_counts = {}         # 同じ列の横に複数の過剰列が出た場合の枝番用
+        extra_counts = {}             # 同じ列の横に複数の過剰列が出た場合の枝番用
 
         for pd_col in pd_orig_cols:
             if pd_col in col_mapping:
@@ -297,8 +389,7 @@ class Csv4dbEvaluator:
             for pd_row_idx, pd_text in enumerate(pd_norm):
                 if pd_row_idx in used_pd_row_idx or not pd_text:
                     continue
-
-                # 行の類似度計算
+                
                 sim = self._get_similarity(gt_text, pd_text)
                 if sim > best_sim and sim > 0.35:
                     best_sim, best_idx = sim, pd_row_idx
