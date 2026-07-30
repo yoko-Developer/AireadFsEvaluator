@@ -110,3 +110,7 @@ data/**/failed/
 data/**/logs/
 data/**/output/
 data/**/success/
+
+# Excel temporary files
+~$*.xlsx
+~$*.xls

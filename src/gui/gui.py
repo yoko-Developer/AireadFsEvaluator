@@ -5,7 +5,7 @@ import sys
 import webbrowser
 import customtkinter as ctk
 
-# local/project imports
+# local/project import
 from src.main import main as run_evaluation
 from src.utils import pathutils
 
@@ -23,11 +23,10 @@ app.geometry("480x360")
 
 label_text = ctk.CTkLabel(
     app, 
-    text="読込完了", 
+    text="実行ボタンを押してください", 
     font=("Hiragino Sans", 20, "bold")
 )
 label_text.pack(pady=60)
-
 def clean_text(val):
     """ノイズ（全角・半角スペース、カンマ、カッコなど）を除去する"""
     text = str(val).replace(' ', '').replace(' ', '')
@@ -36,17 +35,16 @@ def clean_text(val):
 def detect_sheet_name(csv_path):
     """CSVの中身やファイル名から帳票タイトルを判定する"""
     file_name = os.path.basename(csv_path).lower()
-    
-    # ページ番号によるデフォルト判定（_0: BS, _1: PL, _2: 販管費, _3: SS）
-    default_title = ""
-    if "_0.csv" in file_name:
-        default_title = "貸借対照表"
-    elif "_1.csv" in file_name:
-        default_title = "損益計算書"
-    elif "_2.csv" in file_name:
-        default_title = "販売費及び一般管理費明細書"
-    elif "_3.csv" in file_name:
-        default_title = "株主資本等変動計算書"
+
+    # 本物データ（_detail.csv）のファイル名末尾による決定的な判定
+    if re.search(r'_0_detail(\.csv)?$', file_name):
+        return "貸借対照表"
+    elif re.search(r'_1_detail(\.csv)?$', file_name):
+        return "損益計算書"
+    elif re.search(r'_2_detail(\.csv)?$', file_name):
+        return "販売費及び一般管理費明細書"
+    elif re.search(r'_3_detail(\.csv)?$', file_name):
+        return "株主資本等変動計算書"
 
     # CSVの中身から判定
     try:
@@ -62,48 +60,47 @@ def detect_sheet_name(csv_path):
                 return "株主資本等変動計算書"
     except Exception:
         pass
-        
-    return default_title if default_title else "決算書帳票"
+    return "決算書帳票"
 
 def button_click():
     label_text.configure(text="評価処理を実行中...")
     app.update()
-
-    # 1. 丸付けロジック（main.py）を呼び出して最新のresultsを生成
+    # main.py（評価ロジック）を動かす
     project_root = pathutils.get_project_root_dir()
     config_path = str(project_root / ".azure-pipelines" / "config.toml")
-    
+
     sys.argv = ["main.py", "-c", config_path]    
     try:
         run_evaluation()
     except Exception as e:
         print(f"⚠️ 評価実行時の注意: {e}")
 
-    label_text.configure(text="ファイル別レポートを作成中...")
+    label_text.configure(text="ファイルレポートを作成中...")
     app.update()
 
     # 2. 全結果ファイル (full_comparison_*.csv) を探索してPDF（ファイル）ごとにグループ化
     results_dir = project_root / "results" / "fs" / "individual reports"
-    
+
     pdf_groups = {}  # { PDF基本名: [ページごとのデータ] }
-    
+
     total_cumulative_items = 0
     passed_cumulative_items = 0
-
+    
     if results_dir.exists():
         for root, dirs, files in os.walk(results_dir):
-            csv_files = sorted([f for f in files if "full_comparison" in f and f.endswith(".csv")])
+            # _detail.csvのみを対象にする
+            csv_files = sorted([f for f in files if "full_comparison" in f and f.endswith(".csv") and "_detail" in f])
+            
             for file in csv_files:
                 target_csv = os.path.join(root, file)
                 sheet_title = detect_sheet_name(target_csv)
                 
-                # ファイル名からPDF名とページ番号（_0, _1など）を分解
-                file_stem = file.replace("full_comparison_", "").replace(".csv", "")
-                
-                # ページ番号の抽出（末尾の _0, _1 などからページを計算）
+                # ファイル名からPDF名とページ番号を分解（例: ..._0_detail -> ページ1）
+                file_stem = file.replace("full_comparison_", "").replace("_detail.csv", "").replace(".csv", "")
+
                 page_idx_match = re.search(r'_(\d+)$', file_stem)
                 if page_idx_match:
-                    page_num = int(page_idx_match.group(1)) + 1  # 0始まりなら1を足す
+                    page_num = int(page_idx_match.group(1)) + 1
                     pdf_base_name = re.sub(r'_\d+$', '', file_stem)
                 else:
                     page_num = 1
@@ -112,25 +109,29 @@ def button_click():
                 page_items = []
                 page_total = 0
                 page_passed = 0
-                
+
                 with open(target_csv, "r", encoding="utf-8-sig") as f:
                     reader = csv.DictReader(f)
                     for idx, row in enumerate(reader, 1):
-                        item_gt = row.get("c0_gt", row.get("項目正解", "不明"))
-                        item_pd = row.get("c0_pd", row.get("項目読み取り", "不明"))
+                        item_gt = row.get("c0_gt", row.get("項目正解", ""))
+                        item_pd = row.get("c0_pd", row.get("項目読み取り", ""))
                         amt_gt = row.get("c1_gt", "")
                         amt_pd = row.get("c1_pd", "")
-                        
+
+                        # 空行スキップ
+                        if not item_gt and not item_pd and not amt_gt and not amt_pd:
+                            continue
+
                         correct_disp = f"{item_gt} ({amt_gt})" if amt_gt else item_gt
                         recognized_disp = f"{item_pd} ({amt_pd})" if amt_pd else item_pd
-                        
+
                         item_gt_clean = clean_text(item_gt)
                         item_pd_clean = clean_text(item_pd)
                         amt_gt_clean = clean_text(amt_gt)
                         amt_pd_clean = clean_text(amt_pd)
 
                         accuracy_val = str(row.get("accuracy", row.get("一致", "0")))
-                        
+
                         if (
                             accuracy_val in ["100", "100.0", "True", "true", "1"] 
                             or (item_gt_clean == item_pd_clean and amt_gt_clean == amt_pd_clean)
@@ -139,9 +140,9 @@ def button_click():
                             page_passed += 1
                         else:
                             is_ok = False
-                        
+
                         page_total += 1
-                        
+
                         page_items.append({
                             "no": idx,
                             "correct": correct_disp,
@@ -150,7 +151,6 @@ def button_click():
                         })
 
                 page_acc = (page_passed / page_total * 100) if page_total > 0 else 0
-                
                 total_cumulative_items += page_total
                 passed_cumulative_items += page_passed
 
@@ -171,14 +171,15 @@ def button_click():
 
     # 3. PDF（ファイル）ごとにまとめたHTMLとExcel用データの生成
     pdf_cards_html = ""
-    
+
+
     excel_export_path = project_root / "results" / "fs" / "全ページ詳細明細_Excel用.csv"
     with open(excel_export_path, "w", encoding="utf-8-sig", newline="") as ef:
         writer = csv.writer(ef)
         writer.writerow(["PDFファイル名", "ページ番号", "帳票タイトル", "No", "正解データ", "AIRead読み取り結果", "判定(1/0)"])
 
         for pdf_idx, (pdf_name, pages) in enumerate(pdf_groups.items(), 1):
-            # ページ順にソート
+            
             pages = sorted(pages, key=lambda x: x["page_num"])
             
             pdf_total = sum(p["page_total"] for p in pages)
@@ -186,28 +187,28 @@ def button_click():
             pdf_acc = (pdf_passed / pdf_total * 100) if pdf_total > 0 else 0
             
             pdf_acc_class = "result-ok" if pdf_acc >= 90 else "result-ng"
-            
+
             pages_summary_rows = ""
             pages_detail_blocks = ""
 
             for p in pages:
                 p_acc_class = "result-ok" if p["page_acc"] >= 90 else "result-ng"
-                
-                # 簡易サマリーテーブル用
+            
                 pages_summary_rows += f"""
                 <tr>
-                    <td>ページ {p['page_num']}</td>
+
+                    <td style="text-align:center;">ページ {p['page_num']}</td>
                     <td style="font-weight:bold; color:#ff7bd5;">{p['sheet_title']}</td>
-                    <td>{p['page_passed']} / {p['page_total']} 項目</td>
-                    <td class="{p_acc_class}">{p['page_acc']:.1f}%</td>
+                    <td style="text-align:center;">{p['page_passed']} / {p['page_total']} 項目</td>
+                    <td class="{p_acc_class}" style="text-align:center;">{p['page_acc']:.1f}%</td>
                 </tr>
                 """
 
-                # 項目ごとの明細
+
                 item_rows_html = ""
                 for item in p["items"]:
                     r_class = "result-ok" if item["is_ok"] else "result-ng"
-                    r_mark = "●" if item["is_ok"] else "✖"
+                    r_mark = "〇" if item["is_ok"] else "✖"
                     item_rows_html += f"""
                     <tr>
                         <td style="text-align:center;">{item['no']}</td>
@@ -216,8 +217,7 @@ def button_click():
                         <td class="{r_class}" style="text-align:center;">{r_mark}</td>
                     </tr>
                     """
-                    
-                    # Excel書き込み
+                                    
                     writer.writerow([
                         pdf_name,
                         f"ページ {p['page_num']}",
@@ -250,7 +250,6 @@ def button_click():
                 </div>
                 """
 
-            # PDFごとの枠（カード）
             pdf_cards_html += f"""
             <div class="pdf-card">
                 <div class="pdf-header" onclick="toggleDetails('pdf_detail_{pdf_idx}')">
@@ -266,23 +265,22 @@ def button_click():
                 
                 <div id="pdf_detail_{pdf_idx}" class="pdf-body" style="display: block;">
                     <div class="page-summary-table-box">
-                        <h4>【ページ別サマリー】</h4>
+                        <h4 style="color:#ff7bd5; margin:0 0 10px 0;">【ページ別サマリー】</h4>
                         <table class="summary-table">
                             <thead>
                                 <tr>
-                                    <th>ページ</th>
+                                    <th style="text-align:center;">ページ</th>
                                     <th>帳票タイトル</th>
-                                    <th>正解数 / 項目数</th>
-                                    <th>正解率</th>
+                                    <th style="text-align:center;">正解数 / 項目数</th>
+                                    <th style="text-align:center;">正解率</th>
                                 </tr>
                             </thead>
                             <tbody>
                                 {pages_summary_rows}
                             </tbody>
                         </table>
-                    </div>
-                    
-                    <h4 style="color:#ff7bd5; margin-top:20px;">【全ページ・全項目 明細照合】</h4>
+                    </div>               
+                    <h4 style="color:#ff7bd5; margin-top:25px;">【全ページ・全項目 明細照合】</h4>
                     {pages_detail_blocks}
                 </div>
             </div>
@@ -498,15 +496,18 @@ def button_click():
 
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html_content)
-        
+
     webbrowser.open(html_path)
+
+    label_text.configure(text="✨評価完了✨")
+    app.update()
 
 button = ctk.CTkButton(
     app, 
-    text="テスト実行", 
+    text="実行", 
     font=("Hiragino Sans", 14, "bold"),
     command=button_click
 )
 button.pack(pady=20)
 
-app.mainloop()
+app.mainloop() 
