@@ -173,7 +173,7 @@ class Csv4dbEvaluator:
                                 pl_acc = p_acc_num
                             elif re.search(r'_2(_detail)?\.csv$', page_file_name):
                                 p_title = "販売費及び一般管理費明細書"
-                                sg_acc = p_acc_num  # ★ _2.csv は絶対に販管費！これで87.3%が入る！
+                                sg_acc = p_acc_num  # ★ _2.csv は絶対に販管費！
                             elif re.search(r'_3(_detail)?\.csv$', page_file_name):
                                 p_title = "株主資本等変動計算書"
                                 ss_acc = p_acc_num
@@ -216,78 +216,102 @@ class Csv4dbEvaluator:
     # CSV読み込み
     # ==========================================
     def _load_csv_to_dataframe(self, gt_path: Path, pd_path: Path) -> Tuple[Optional[pandas.DataFrame], Optional[pandas.DataFrame]]:
-        """正解データと比較対象データの両方のcsvを読み込む。"""
-        gt_df: pandas.DataFrame = None
-        pd_df: pandas.DataFrame = None
-        try:
-            gt_df = cast(pandas.DataFrame, pandas.read_csv(gt_path, header=0, dtype=str, encoding=fileutils.detect_encoding(gt_path)))
-        except Exception as e:
-            logging.warning(f"CSV load error for {gt_path.name}: {e}")
-            return None, None
+        """正解データと比較対象データの両方のcsvを読み込む。（数値のカンマで列が壊れるのを防止）"""
+        import csv
 
-        try:
-            pd_df = cast(pandas.DataFrame, pandas.read_csv(pd_path, header=0, dtype=str, encoding=fileutils.detect_encoding(pd_path)))
-        except Exception as e:
-            logging.warning(f"CSV load error for {pd_path.name}: {e}")
+        def safe_read_csv(file_path: Path) -> Optional[pandas.DataFrame]:
+            try:
+                enc = fileutils.detect_encoding(file_path)
+                
+                # csv.reader を使ってダブルクォーテーション内のカンマを保護しながら行をパース
+                rows = []
+                with open(file_path, 'r', encoding=enc, newline='') as f:
+                    reader = csv.reader(f)
+                    for row in reader:
+                        if row:  # 空行スキップ
+                            rows.append([str(cell).strip() for cell in row])
+
+                if not rows:
+                    return pandas.DataFrame()
+
+                # 最大列数を計算
+                max_cols = max(len(r) for r in rows)
+
+                # 全行の列数を揃える
+                padded_rows = [r + [''] * (max_cols - len(r)) for r in rows]
+
+                # 1行目をヘッダーとする
+                headers = padded_rows[0]
+                data_rows = padded_rows[1:]
+
+                # カラム名の一意化処理
+                col_names = []
+                counts = {}
+                for idx, h in enumerate(headers):
+                    h_str = h if h != '' else f"col_{idx}"
+                    counts[h_str] = counts.get(h_str, 0) + 1
+                    if counts[h_str] > 1:
+                        col_names.append(f"{h_str}_{counts[h_str]-1}")
+                    else:
+                        col_names.append(h_str)
+
+                df = pandas.DataFrame(data_rows, columns=col_names, dtype=str).fillna('')
+                return df
+
+            except Exception as e:
+                logging.warning(f"CSV load error for {file_path.name}: {e}")
+                return None
+
+        gt_df = safe_read_csv(gt_path)
+        pd_df = safe_read_csv(pd_path)
+
+        if gt_df is None or pd_df is None:
             return None, None
 
         return gt_df, pd_df
-
+    
     # ==========================================
     # 列の紐付け (Column Alignment)
     # ==========================================
     def _align_columns_by_fuzzy_match(self, gt_df: pandas.DataFrame, pd_df: pandas.DataFrame) -> Tuple[pandas.DataFrame, pandas.DataFrame]:
         """列名と列データの両方の特徴を捉え、GTとPDの列を物理的に同期させる"""
-        # ヘッダー行をデータの先頭行に差し込み、ヘッダ名を書き換えるので書き換える前のヘッダ行を控えておく
         gt_orig_cols = gt_df.columns.tolist()
         pd_orig_cols = pd_df.columns.tolist()
 
-        # 列全体（ヘッダー＋データ）の特徴文字列を作成
         gt_profiles = self._create_column_profiles(gt_df, gt_orig_cols)
         pd_profiles = self._create_column_profiles(pd_df, pd_orig_cols)
 
-        # 全組み合わせの類似度スコアを計算
         matches: List[Dict[str, float]] = self._calculate_column_similarity_scores(
             gt_orig_cols, gt_profiles, pd_orig_cols, pd_profiles
         )
 
-        # スコア順に1対1でペアを確定
         col_mapping: Dict[str, str] = self._determine_column_mapping(matches, pd_orig_cols)
 
-        # GT側の列名を c0_gt, c1_gt, ... に書き換え
         gt_df.columns = pandas.Index([f"c{i}_gt" for i in range(len(gt_orig_cols))])
 
-        # --- PD側の列名書き換え（直前のcXXを引き継いでネーミングする） ---
         pd_col_new_names = []
-        last_matched_col = "col_top"  # 紐付く前にいきなり過剰列が出た場合用
-        extra_counts = {}             # 同じ列の横に複数の過剰列が出た場合の枝番用
+        last_matched_col = "col_top"
+        extra_counts = {}
 
         for pd_col in pd_orig_cols:
             if pd_col in col_mapping:
-                # 紐付いた列の場合は、その名前(cXX)を適用し、最後に紐付いた名前として記憶
                 matched_name = col_mapping[pd_col]
                 pd_col_new_names.append(matched_name)
                 last_matched_col = matched_name
             else:
-                # 紐付かなかった列の場合は、直前に紐付いた名前を使って extra_cXX にする
                 extra_counts[last_matched_col] = extra_counts.get(last_matched_col, 0) + 1
                 count = extra_counts[last_matched_col]
 
                 suffix = f"_{count}" if count > 1 else ""
 
                 if last_matched_col == "col_top":
-                    # 一番最初の列(c0)より前に出たゴミ列
                     pd_col_new_names.append(f"extra_pre{suffix}")
                 else:
-                    # 例: c9 の次に出たゴミ列なら "extra_c9" になる
                     pd_col_new_names.append(f"extra_{last_matched_col}{suffix}")
 
-        # 全列名の末尾に"_pd"を追加
         pd_col_new_names = [name + "_pd" for name in pd_col_new_names]
         pd_df.columns = pandas.Index(pd_col_new_names)
-        # ------------------------------------------------------------------------
 
-        # 元のヘッダーをデータの-1行目として挿入（レポートでの表示用）
         self._insert_headers_as_data_row(gt_df, gt_orig_cols)
         self._insert_headers_as_data_row(pd_df, pd_orig_cols)
 
@@ -299,16 +323,9 @@ class Csv4dbEvaluator:
         profiles = []
 
         for col_name in cols:
-            # 1. 列データから空欄(NaN)を除外し、すべて文字列に変換する
             valid_data = df[col_name].dropna().astype(str)
-
-            # 2. データをひと繋ぎの文字列にする (例: ["100", "200"] -> "100200")
             data_str = "".join(valid_data)
-
-            # 3. ヘッダー名とデータをくっつけ、不要な記号などのノイズを除去（正規化）する
             normalized_str = self._normalize_text(col_name + data_str)
-
-            # 4. 計算量の爆発を防ぐため、指定文字数で切り出してリストに追加する
             profiles.append(normalized_str[:max_len])
 
         return profiles
@@ -325,22 +342,17 @@ class Csv4dbEvaluator:
             for pd_idx, (pd_col, pd_profile) in enumerate(zip(pd_cols, pd_profs)):
                 pd_header_norm = self._normalize_text(pd_col)
 
-                header_sim = self._get_similarity(gt_header_norm, pd_header_norm) # ヘッダ文字列同士の類似度
-                full_sim = self._get_similarity(gt_profile, pd_profile) # ヘッダ＆値全てをマージした文字列同士の類似度
+                header_sim = self._get_similarity(gt_header_norm, pd_header_norm)
+                full_sim = self._get_similarity(gt_profile, pd_profile)
 
-                # ヘッダーもデータも全く似ていない場合は足切り
                 if header_sim < 0.3 and full_sim < 0.3:
                     continue
 
-                # 表における列の物理的位置の類似度
                 pos_sim = 1.0 - (abs(gt_idx / len(gt_cols) - pd_idx / len(pd_cols)))
-
-                # スコアを確定
                 score = (full_sim * 0.5) + (header_sim * 0.4) + (pos_sim * 0.1)
 
                 scored_matches.append({'gt_idx': gt_idx, 'pd_idx': pd_idx, 'score': score})
 
-        # スコアの高い順にソート
         return sorted(scored_matches, key=lambda x: x['score'], reverse=True)
 
 
@@ -361,7 +373,6 @@ class Csv4dbEvaluator:
 
     def _insert_headers_as_data_row(self, df: pandas.DataFrame, original_headers: List[str]) -> None:
         """元のヘッダー名をインデックス -1 のデータ行として挿入する"""
-        # ループを回さず、リストの結合で一括代入
         padding = [""] * (len(df.columns) - len(original_headers))
         df.loc[-1] = original_headers + padding
         df.index = df.index + 1
@@ -373,11 +384,9 @@ class Csv4dbEvaluator:
     # ==========================================
     def _align_rows_by_fuzzy_match(self, gt_df: pandas.DataFrame, pd_df: pandas.DataFrame) -> Tuple[pandas.DataFrame, pandas.DataFrame]:
         """近似マッチングを用いて、正解行と推論行を紐付けたDataFrameを作成する"""
-        # 行マッチの推論のため、DataFrameの1行分のデータを、すべて横にガッチャンコして1つの文字列にしたリストを作成
         gt_norm = gt_df.apply(lambda r: self._normalize_text(''.join(r.dropna().astype(str))), axis=1).tolist()
         pd_norm = pd_df.apply(lambda r: self._normalize_text(''.join(r.dropna().astype(str))), axis=1).tolist()
 
-        # 正解行を基準にマッチする推論行を探索
         matched_pairs = []
         used_pd_row_idx = set()
         for gt_row_idx, gt_text in enumerate(gt_norm):
@@ -400,28 +409,21 @@ class Csv4dbEvaluator:
             else:
                 matched_pairs.append((gt_row_idx, None))
 
-        # 正解データと比較対象データの1列目にrow_idを挿入
         gt_df.insert(0, 'row_id', [f"r{i}" for i in range(len(gt_df))])
         pd_df.insert(0, 'row_id', "")
 
-        # 1. どこにもマッチしなかったPD（過剰行）のインデックスを昇順リストで用意しておく
-        # （setの引き算を使って、全PDインデックスから使用済みを引く）
         unmatched_pd_row_indices = sorted(set(range(len(pd_df))) - used_pd_row_idx)
 
-        # 比較対象データのrow_idを採番
         for gt_row_idx, pd_row_idx in matched_pairs:
             if pd_row_idx is not None:
-                # 3. predictionテーブルにマッチした行がある場合、該当行より「上」にある過剰行をすべて吐き出す
                 suffix: int = 0
                 while unmatched_pd_row_indices and unmatched_pd_row_indices[0] < pd_row_idx:
-                    extra_row_idx = unmatched_pd_row_indices.pop(0) # 先頭から取り出して削除
+                    extra_row_idx = unmatched_pd_row_indices.pop(0)
                     pd_df.loc[extra_row_idx, 'row_id'] = f"extra_r{gt_row_idx}" if suffix == 0 else f"extra_r{gt_row_idx}_{suffix}"
                     suffix += 1
 
-                # 4. マッチした正規行を採番
                 pd_df.loc[pd_row_idx, 'row_id'] = f"r{gt_row_idx}"
 
-        # 5. 最後に残った（どこにも挟まれなかった末尾の）過剰行を採番
         for extra_row_idx in unmatched_pd_row_indices:
             pd_df.loc[extra_row_idx, 'row_id'] = f"extra_r{extra_row_idx}"
 
@@ -440,27 +442,22 @@ class Csv4dbEvaluator:
 
         ordered_cols = self._determine_report_column_order(merged_df)
 
-        # --- CSV保存ディレクトリの準備 ---
         csv_dir = individual_dir / "csv" / file_stem
         csv_dir.mkdir(parents=True, exist_ok=True)
 
-        # 1. 【差分リストCSV】分析・集計用（縦積み形式）
         diff_file = f"diff_list_{file_name}"
         if not diff_df.empty:
             diff_list_df = self._format_diff_for_csv(diff_df, ordered_cols)
             diff_list_df.to_csv(csv_dir / diff_file, index=False, encoding="utf-8-sig")
         else:
-            # 空のDataFrameを保存する場合
             pandas.DataFrame({"message": ["no differences found."]}).to_csv(csv_dir / f"diff_list_{file_name}", index=False, encoding="utf-8-sig")
         logging.info(f"📄 差分レポート(CSV)を保存: {csv_dir / diff_file}")
 
-        # 2. 【全データ比較CSV】全体俯瞰用（横並び形式）
         full_comparison_file = f"full_comparison_{file_name}"
         full_comparison_df = self._format_full_comparison_csv(merged_df, ordered_cols)
         full_comparison_df.to_csv(csv_dir / full_comparison_file, index=False, encoding="utf-8-sig")
         logging.info(f"📄 全データ比較レポートを保存: {csv_dir / full_comparison_file}")
 
-        # --- HTML出力 (視認性の高いカスタムレポート) ---
         html_dir = individual_dir / "html"
         html_dir.mkdir(parents=True, exist_ok=True)
         html_file = f"diff_{file_stem}.html"
@@ -469,11 +466,6 @@ class Csv4dbEvaluator:
 
 
     def _determine_report_column_order(self, merged_df: pandas.DataFrame) -> List[str]:
-        """
-        過剰列(extra_c0等)が推論結果の元々の位置に表示されるように、列の並び順を決定する
-        c0_gt, c0_pd, c1_gt, c1_pd, ...
-        → c0, c1, c2, ... （_gt, _pdを削除して、重複排除される）
-        """
         gt_cols = [re.sub(r'_gt$', '', c) for c in merged_df.columns if c.endswith('_gt')]
         pd_cols = [re.sub(r'_pd$', '', c) for c in merged_df.columns if c.endswith('_pd')]
 
@@ -487,12 +479,7 @@ class Csv4dbEvaluator:
         return ordered_cols
 
 
-    # 個別CSVレポート生成 (CSV Report)
     def _format_diff_for_csv(self, diff_df: pandas.DataFrame, ordered_cols: List[str]) -> pandas.DataFrame:
-        """
-        横長の差分データを、人が目視で確認・フィルタリングしやすい
-        「エラー箇所のみを縦にリストアップした形式」に変換する。
-        """
         csv_rows = []
         for _, row in diff_df.iterrows():
             row_id = row.get('row_id', '')
@@ -502,7 +489,6 @@ class Csv4dbEvaluator:
                 gt_val = str(row.get(f"{col}_gt", "")).replace(' ', '').replace(' ', '').strip()
                 pd_val = str(row.get(f"{col}_pd", "")).replace(' ', '').replace(' ', '').strip()
                 
-                # 一致しているセルは出力しない（エラー箇所のみ抽出）
                 if gt_val == pd_val:
                     continue
 
@@ -524,15 +510,8 @@ class Csv4dbEvaluator:
 
 
     def _format_full_comparison_csv(self, merged_df: pandas.DataFrame, ordered_cols: List[str]) -> pandas.DataFrame:
-        """
-        全ての行・列を含み、GTとPDを横に並べたCSV用DataFrameを作成する。
-        Excelで開いた際、左側に管理情報（IDや精度）、右側にデータ本体が来るように構成。
-        """
-        # 管理用カラムの定義
         base_cols = ['row_id', 'row_presence', 'accuracy', "match_count", "item_count"]
 
-        # データの並び替え: 各列IDごとに GT と PD を隣り合わせる
-        # 例: [row_id, row_presence, accuracy, c0_gt, c0_pd, c1_gt, c1_pd, ...]
         data_cols = []
         for col in ordered_cols:
             if f"{col}_gt" in merged_df.columns:
@@ -543,15 +522,10 @@ class Csv4dbEvaluator:
         return merged_df[base_cols + data_cols].copy()
 
 
-    # 個別HTMLレポート生成 (HTML Report)
     def _export_html_report(self, merged_df: pandas.DataFrame, output_path: Path) -> None:
-        """Pandas DataFrameから直接視認性の高い差分HTMLを生成・保存する"""
-
-        # HTMLbody部のテーブルを構築
         ordered_cols = self._determine_report_column_order(merged_df)
         html_table = self._build_html_table(merged_df, ordered_cols)
 
-        # CSS定義
         custom_style = """
         <style>
             body { font-family: "Helvetica Neue", Helvetica, "Segoe UI", Arial, sans-serif; color: #333; margin: 30px; line-height: 1.4; }
@@ -571,7 +545,6 @@ class Csv4dbEvaluator:
         </style>
         """
 
-        # フルHTMLの構築
         full_html = f"""
         <!DOCTYPE html>
         <html lang="ja">
@@ -598,15 +571,12 @@ class Csv4dbEvaluator:
 
 
     def _build_html_table(self, merged_df: pandas.DataFrame, ordered_cols: List[str]) -> str:
-        """データフレームからHTMLテーブルのタグ(文字列)を構築する"""
         lines = ['<table>', '<thead>', '<tr><th class="status-col">@@</th>']
 
-        # 1行目: 列名
         for col in ordered_cols:
             lines.append(f'<th>{col}</th>')
         lines.append('</tr>')
 
-        # 2行目: 列ステータス (--- / +++)
         lines.append('<tr class="col-status-row"><td class="status-col">@@</td>')
         for col in ordered_cols:
             has_gt = f"{col}_gt" in merged_df.columns
@@ -616,7 +586,6 @@ class Csv4dbEvaluator:
             else: lines.append('<td></td>')
         lines.append('</tr></thead><tbody>')
 
-        # データ行
         for _, row in merged_df.iterrows():
             r_status = "row-missing" if row['row_presence'] == 'left_only' else \
                        "row-excess" if row['row_presence'] == 'right_only' else \
@@ -649,32 +618,21 @@ class Csv4dbEvaluator:
     # サマリーレポート生成 (Summary Report)
     # ==========================================
     def _save_summary_report(self, all_results: List[Tuple[str, pandas.DataFrame]]) -> None:
-        """
-        全評価データから統計情報を抽出し、サマリーレポートをセッションフォルダ直下にCSV出力する。
-        """
-        # フォルダは切らずに、ファイル名でサマリーであることを明示
         summary_path = self.session_dir / "summary_report.csv"
 
         file_metrics = []
         for file_name, df in all_results:
-            # データ行のみを抽出
             if df.empty:
                 continue
 
-            # --- 行の統計 ---
             missing_rows = len(df[df['row_presence'] == 'left_only'])
             excess_rows = len(df[df['row_presence'] == 'right_only'])
 
-            # --- 列（カラム）の統計 ---
-            # 接尾辞を除いたベースとなる列名セットを作成
             gt_bases = {col.replace('_gt', '') for col in df.columns if col.endswith('_gt')}
             pd_bases = {col.replace('_pd', '') for col in df.columns if col.endswith('_pd')}
-            # 欠損列: GTにはあるがPDにはない列
             missing_cols = len(gt_bases - pd_bases)
-            # 過剰列: PDにはあるがGTにはない列
             excess_cols = len(pd_bases - gt_bases)
 
-            # --- 指標の集計 ---
             file_metrics.append({
                 'ファイル名': file_name,
                 '項目精度(%)': round((df['match_count'].sum() / df['item_count'].sum() * 100), 2) if df['item_count'].sum() > 0 else 0,
@@ -686,11 +644,9 @@ class Csv4dbEvaluator:
                 '過剰列数(+++)': excess_cols
             })
 
-        # CSV保存（精度が低い順にソートして、改善優先度を見やすくする）
         file_summary_df = pandas.DataFrame(file_metrics)
         file_summary_df.to_csv(summary_path, index=False, encoding="utf-8-sig")
 
-        # コンソール表示
         logging.info(f"📊 Summary Report Created: {summary_path}\n")
 
 
@@ -699,9 +655,10 @@ class Csv4dbEvaluator:
     # ==========================================
     @staticmethod
     def _normalize_text(text: str) -> str:
-        """比較のノイズとなる記号やスペースを除去"""
-        text_clean = str(text).replace(' ', '').replace(' ', '')
-        return re.sub(r'[【】\(\)（）※\*＊\s\t,、]', '', text_clean)
+        """★カンマもピリオドも一切消さない！スペース（空白・タブ・全角空白）のみを除去して100%厳格評価★"""
+        text_str = str(text or '')
+        # カンマ(,)やピリオド(.)は消さずにそのまま比較し、半角・全角スペースとタブのみを除去する！
+        return re.sub(r'[\s\t\u3000]', '', text_str)
 
     @staticmethod
     def _get_similarity(text1: str, text2: str) -> float:
@@ -715,7 +672,6 @@ class Csv4dbEvaluator:
     @staticmethod
     def _calc_data_accuracy_by_row(row: pandas.Series) -> pandas.Series:
         """行単位の正解データ数/推論データと正解データとの一致数/精度を計算"""
-        # "_gt", "_pd"で終わる列をそれぞれ抽出
         gt_cols = [col for col in row.index if col.endswith('_gt')]
 
         item_count = 0
@@ -730,25 +686,20 @@ class Csv4dbEvaluator:
 
             pd_col = gt_col.replace('_gt', '_pd')
             if pd_col in row.index:
-                # 値の取得
                 pd_val = str(row[pd_col]) if pandas.notna(row[pd_col]) else ""
                 
-                # ノイズ（カンマやカッコ、スペースなど）を削除
                 gt_norm = Csv4dbEvaluator._normalize_text(gt_val)
                 pd_norm = Csv4dbEvaluator._normalize_text(pd_val)
                 
-                # 🌟 正規化後の文字列（gt_norm, pd_norm）同士で一致判定！
                 if gt_norm == pd_norm:
                     match_count += 1
 
         accuracy = (match_count / item_count) * 100 if item_count > 0 else 0
         accuracy = round(accuracy, 2)
 
-        # 3つの値をセットで返す
         return pandas.Series([item_count, match_count, accuracy])
 
     def _extract_differences(self, df: pandas.DataFrame) -> pandas.DataFrame:
         """不一致行のみを抽出する（並び順は抽出元の自然な状態を維持する）"""
-        # ソート処理を削除し、DataFrameの元の綺麗な並び順を維持したまま抽出する
         return df[(df['accuracy'] < 100) | (df['row_presence'] != 'both')].copy()
     
