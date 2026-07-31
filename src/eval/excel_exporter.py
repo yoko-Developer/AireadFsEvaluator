@@ -8,24 +8,25 @@ from openpyxl.utils import get_column_letter
 
 class KessanExcelExporter:
     """
-    決算5表評価結果をセル単位比較Excelとして出力するクラス
+    決算5表評価結果をセル単位比較Excelとして出力するクラス（ブランク対応＆安全取得版）
     """
 
-    # 🎨 スタイル定義
-    PASTEL_PINK_FILL = PatternFill(start_color="F875DD", end_color="F875DD", fill_type="solid")  # ヘッダー用ピンク
-    LIGHT_BLUE_FILL = PatternFill(start_color="E1F5FE", end_color="E1F5FE", fill_type="solid")   # 最下行用薄い水色
-    ALERT_FILL = PatternFill(start_color="FF6EC7", end_color="FF6EC7", fill_type="solid")       # エラー用濃いピンク
-    PAGE_TITLE_FILL = PatternFill(start_color="F0C0FE", end_color="F0C0FE", fill_type="solid")  # ページ見出し用
+    PASTEL_PINK_FILL = PatternFill(start_color="F875DD", end_color="F875DD", fill_type="solid")
+    LIGHT_BLUE_FILL = PatternFill(start_color="E1F5FE", end_color="E1F5FE", fill_type="solid")
+    SUBTOTAL_FILL = PatternFill(start_color="F5E6FA", end_color="F5E6FA", fill_type="solid")
+    ALERT_FILL = PatternFill(start_color="FF6EC7", end_color="FF6EC7", fill_type="solid")
+    PAGE_TITLE_FILL = PatternFill(start_color="F0C0FE", end_color="F0C0FE", fill_type="solid")
+    HEADER_ROW_FILL = PatternFill(start_color="F1F3F5", end_color="F1F3F5", fill_type="solid")
 
-    # 🔤 フォント
     TITLE_FONT = Font(name="Yu Gothic", size=14, bold=True, color="000000")
     HEADER_FONT = Font(name="Yu Gothic", size=11, bold=True, color="FFFFFF")
     REGULAR_FONT = Font(name="Yu Gothic", size=10, color="000000")
+    HEADER_ROW_FONT = Font(name="Yu Gothic", size=10, bold=True, color="495057")
+    SUBTOTAL_FONT = Font(name="Yu Gothic", size=10, bold=True, color="4A148C")
     TOTAL_FONT = Font(name="Yu Gothic", size=11, bold=True, color="000000")
     PAGE_TITLE_FONT = Font(name="Yu Gothic", size=10, bold=True, color="4A148C")
-    ALERT_FONT = Font(name="Yu Gothic", size=10, bold=True, color="FFFFFF") # エラー時白文字
+    ALERT_FONT = Font(name="Yu Gothic", size=10, bold=True, color="FFFFFF")
 
-    # 🔲 罫線（枠線）定義
     THIN_BORDER = Border(
         left=Side(style='thin', color='B0BEC5'),
         right=Side(style='thin', color='B0BEC5'),
@@ -40,10 +41,27 @@ class KessanExcelExporter:
         bottom=Side(style='double', color='000000')
     )
 
+    SYSTEM_KEYS = {"page", "formid", "account", "amount_0", "amount_1", "amount_2", "amount_3", "amount", "金額"}
+
+    @classmethod
+    def clean_str(cls, val: Any) -> str:
+        if pd.isna(val) or val is None:
+            return ""
+        s = str(val).strip()
+        if s.endswith(".0"):
+            s = s[:-2]
+        return s
+
     @classmethod
     def normalize_text(cls, text: str) -> str:
-        """ノイズ除去比較（【】()（）スペース・記号全消去）"""
-        return re.sub(r'[【】\(\)（）※\*＊\s\t,、]', '', str(text or ''))
+        text_str = cls.clean_str(text)
+        return re.sub(r'[\s\t\u3000]', '', text_str)
+
+    @classmethod
+    def is_system_header_row(cls, gt_text: str, pd_text: str) -> bool:
+        clean_gt = cls.normalize_text(gt_text).lower()
+        clean_pd = cls.normalize_text(pd_text).lower()
+        return clean_gt in cls.SYSTEM_KEYS or clean_pd in cls.SYSTEM_KEYS
 
     @classmethod
     def export_kessan_report(
@@ -59,8 +77,6 @@ class KessanExcelExporter:
         # シート1: 📊 決算5表 マトリックス集計表
         # -------------------------------------------------------------
         ws_matrix = wb.create_sheet(title="マトリックス表")
-        
-        # ✨【修正】背景の標準目盛り線を非表示（False）にする！
         ws_matrix.views.sheetView[0].showGridLines = False
 
         ws_matrix.cell(row=1, column=1, value="決算5表 精度評価マトリックスレポート").font = cls.TITLE_FONT
@@ -79,7 +95,6 @@ class KessanExcelExporter:
 
         ws_matrix.row_dimensions[2].height = 28
 
-        # 帳票キー表記ゆれマッピング対応表
         kessan_map = {
             "BS": ["BS", "BS_acc", "貸借対照表", "貸借対照表_acc"],
             "PL": ["PL", "PL_acc", "損益計算書", "損益計算書_acc"],
@@ -134,7 +149,6 @@ class KessanExcelExporter:
 
             row_idx += 1
             
-        # 最下行：累計合計
         total_row = row_idx
         ws_matrix.cell(row=total_row, column=1, value="")
         ws_matrix.cell(row=total_row, column=2, value="【 累計合計/平均 】").alignment = Alignment(horizontal="center", vertical="center")
@@ -155,7 +169,6 @@ class KessanExcelExporter:
         tot_acc_cell.number_format = '0.0%'
         tot_acc_cell.alignment = Alignment(horizontal="center", vertical="center")
 
-        # 各帳票列（G〜K列）の平均正解率計算
         col_letters = ['G', 'H', 'I', 'J', 'K']
         for c_let in col_letters:
             col_cell = ws_matrix.cell(row=total_row, column=openpyxl.utils.column_index_from_string(c_let))
@@ -185,131 +198,195 @@ class KessanExcelExporter:
         for sheet_name, page_df_list in detail_dfs:
             safe_title = re.sub(r'[\\/*?:\[\]]', '', sheet_name)[:28]
             ws_detail = wb.create_sheet(title=safe_title)
-            
-            # ✨【修正】背景の標準目盛り線を非表示（False）にする！
             ws_detail.views.sheetView[0].showGridLines = False
+
+            max_c_count = 1
+            for _, df_p in page_df_list:
+                gt_cols = [c for c in df_p.columns if re.match(r'^c\d+_gt$', c)]
+                max_c_count = max(max_c_count, len(gt_cols))
+
+            total_cols_count = 1 + (max_c_count * 3) + 1
 
             ws_detail.row_dimensions[1].height = 22
             ws_detail.row_dimensions[2].height = 22
 
-            # 1行目・2行目の縦結合
             ws_detail.merge_cells("A1:A2")
             ws_detail.cell(row=1, column=1, value="No")
 
-            ws_detail.merge_cells("H1:H2")
-            ws_detail.cell(row=1, column=8, value="正解率")
+            last_col_letter = get_column_letter(total_cols_count)
+            ws_detail.merge_cells(f"{last_col_letter}1:{last_col_letter}2")
+            ws_detail.cell(row=1, column=total_cols_count, value="行正解率")
 
-            # 1行目の横結合
-            ws_detail.merge_cells("B1:D1")
-            ws_detail.cell(row=1, column=2, value="科目")
+            for c_i in range(max_c_count):
+                start_c = 2 + (c_i * 3)
+                end_c = start_c + 2
+                start_let = get_column_letter(start_c)
+                end_let = get_column_letter(end_c)
 
-            ws_detail.merge_cells("E1:G1")
-            ws_detail.cell(row=1, column=5, value="金額")
+                grp_title = "科目" if c_i == 0 else f"金額{c_i}" if max_c_count > 2 else "金額"
+                ws_detail.merge_cells(f"{start_let}1:{end_let}1")
+                ws_detail.cell(row=1, column=start_c, value=grp_title)
 
-            # 2行目のサブヘッダー
-            ws_detail.cell(row=2, column=2, value="マスタ")
-            ws_detail.cell(row=2, column=3, value="読み取り")
-            ws_detail.cell(row=2, column=4, value="判定")
+                ws_detail.cell(row=2, column=start_c, value="マスタ")
+                ws_detail.cell(row=2, column=start_c + 1, value="読み取り")
+                ws_detail.cell(row=2, column=start_c + 2, value="判定")
 
-            ws_detail.cell(row=2, column=5, value="マスタ")
-            ws_detail.cell(row=2, column=6, value="読み取り")
-            ws_detail.cell(row=2, column=7, value="判定")
-
-            # 全ヘッダーセル（1行目・2行目）の装飾 ＆ 罫線一括適用
             for r in [1, 2]:
-                for c in range(1, 9):
+                for c in range(1, total_cols_count + 1):
                     cell = ws_detail.cell(row=r, column=c)
                     cell.fill = cls.PASTEL_PINK_FILL
                     cell.font = cls.HEADER_FONT
                     cell.alignment = Alignment(horizontal="center", vertical="center")
                     cell.border = cls.THIN_BORDER
 
-            current_row = 3  # データ開始行
+            current_row = 3
 
             for p_title, df_page in page_df_list:
-                page_items = 0
-                page_matches = 0
-
-                # ページタイトル行（紫枠）
                 title_row_idx = current_row
-                ws_detail.merge_cells(start_row=title_row_idx, start_column=1, end_row=title_row_idx, end_column=8)
+                ws_detail.merge_cells(start_row=title_row_idx, start_column=1, end_row=title_row_idx, end_column=total_cols_count)
                 ws_detail.row_dimensions[title_row_idx].height = 22
                 current_row += 1
 
                 item_no = 1
-                for row in df_page.itertuples():
-                    c0_gt = str(getattr(row, 'c0_gt', '')) if pd.notna(getattr(row, 'c0_gt', '')) else ''
-                    c0_pd = str(getattr(row, 'c0_pd', '')) if pd.notna(getattr(row, 'c0_pd', '')) else ''
-                    c1_gt = str(getattr(row, 'c1_gt', '')) if pd.notna(getattr(row, 'c1_gt', '')) else ''
-                    c1_pd = str(getattr(row, 'c1_pd', '')) if pd.notna(getattr(row, 'c1_pd', '')) else ''
+                col_item_counts = [0] * max_c_count
+                col_match_counts = [0] * max_c_count
 
-                    norm_c0_gt = cls.normalize_text(c0_gt)
-                    norm_c0_pd = cls.normalize_text(c0_pd)
-                    norm_c1_gt = cls.normalize_text(c1_gt)
-                    norm_c1_pd = cls.normalize_text(c1_pd)
+                # ★安全な辞書変換でエラー回避★
+                for _, row_series in df_page.iterrows():
+                    row_dict = row_series.to_dict()
 
-                    c0_match = (norm_c0_gt == norm_c0_pd) if norm_c0_gt else True
-                    c1_match = (norm_c1_gt == norm_c1_pd) if norm_c1_gt else True
+                    c0_gt_raw = cls.clean_str(row_dict.get('c0_gt', ''))
+                    c0_pd_raw = cls.clean_str(row_dict.get('c0_pd', ''))
 
-                    total_cells = (1 if c0_gt else 0) + (1 if c1_gt else 0)
-                    matched_cells = (1 if c0_gt and c0_match else 0) + (1 if c1_gt and c1_match else 0)
-                    
-                    page_items += total_cells
-                    page_matches += matched_cells
-                    row_acc = (matched_cells / total_cells) if total_cells > 0 else 1.0
+                    is_sys_row = cls.is_system_header_row(c0_gt_raw, c0_pd_raw)
 
-                    # 各列の値と配置のセット
-                    ws_detail.cell(row=current_row, column=1, value=item_no).alignment = Alignment(horizontal="center", vertical="center")
-                    ws_detail.cell(row=current_row, column=2, value=c0_gt).alignment = Alignment(vertical="center")
-                    ws_detail.cell(row=current_row, column=3, value=c0_pd).alignment = Alignment(vertical="center")
-                    
-                    c0_cell = ws_detail.cell(row=current_row, column=4, value="〇" if c0_match else "×")
-                    c0_cell.alignment = Alignment(horizontal="center", vertical="center")
-                    if not c0_match: 
-                        c0_cell.fill = cls.ALERT_FILL
-                        c0_cell.font = cls.ALERT_FONT
+                    ws_detail.cell(row=current_row, column=1, value=item_no if not is_sys_row else "-").alignment = Alignment(horizontal="center", vertical="center")
 
-                    ws_detail.cell(row=current_row, column=5, value=c1_gt).alignment = Alignment(vertical="center")
-                    ws_detail.cell(row=current_row, column=6, value=c1_pd).alignment = Alignment(vertical="center")
-                    
-                    c1_cell = ws_detail.cell(row=current_row, column=7, value="〇" if c1_match else "×")
-                    c1_cell.alignment = Alignment(horizontal="center", vertical="center")
-                    if not c1_match: 
-                        c1_cell.fill = cls.ALERT_FILL
-                        c1_cell.font = cls.ALERT_FONT
+                    row_total_cells = 0
+                    row_matched_cells = 0
 
-                    acc_c = ws_detail.cell(row=current_row, column=8, value=row_acc)
-                    acc_c.number_format = '0.0%'
-                    acc_c.alignment = Alignment(horizontal="right", vertical="center")
+                    for c_i in range(max_c_count):
+                        col_gt_name = f"c{c_i}_gt"
+                        col_pd_name = f"c{c_i}_pd"
 
-                    # 格子枠線（THIN_BORDER）を自動適用
-                    for col_i in range(1, 9):
+                        gt_val_raw = cls.clean_str(row_dict.get(col_gt_name, ''))
+                        pd_val_raw = cls.clean_str(row_dict.get(col_pd_name, ''))
+
+                        norm_gt = cls.normalize_text(gt_val_raw)
+                        norm_pd = cls.normalize_text(pd_val_raw)
+
+                        start_c = 2 + (c_i * 3)
+
+                        if is_sys_row:
+                            align_gt = "center"
+                            align_pd = "center"
+                        else:
+                            align_gt = "right" if c_i > 0 and norm_gt.replace('-', '').replace(',', '').isdigit() else "left"
+                            align_pd = "right" if c_i > 0 and norm_pd.replace('-', '').replace(',', '').isdigit() else "left"
+
+                        ws_detail.cell(row=current_row, column=start_c, value=gt_val_raw).alignment = Alignment(horizontal=align_gt, vertical="center")
+                        ws_detail.cell(row=current_row, column=start_c + 1, value=pd_val_raw).alignment = Alignment(horizontal=align_pd, vertical="center")
+                        judge_cell = ws_detail.cell(row=current_row, column=start_c + 2)
+                        judge_cell.alignment = Alignment(horizontal="center", vertical="center")
+
+                        if is_sys_row:
+                            judge_cell.value = "-"
+                        else:
+                            # ★両方空欄（値がない）場合はブランクにする！★
+                            if not norm_gt and not norm_pd:
+                                judge_cell.value = ""
+                            else:
+                                is_match = (norm_gt == norm_pd)
+                                judge_cell.value = "〇" if is_match else "×"
+                                if not is_match:
+                                    judge_cell.fill = cls.ALERT_FILL
+                                    judge_cell.font = cls.ALERT_FONT
+
+                                if gt_val_raw:
+                                    row_total_cells += 1
+                                    col_item_counts[c_i] += 1
+                                    if is_match:
+                                        row_matched_cells += 1
+                                        col_match_counts[c_i] += 1
+
+                    acc_c = ws_detail.cell(row=current_row, column=total_cols_count)
+                    if is_sys_row:
+                        acc_c.value = "-"
+                        acc_c.alignment = Alignment(horizontal="center", vertical="center")
+                    else:
+                        row_acc = (row_matched_cells / row_total_cells) if row_total_cells > 0 else 1.0
+                        acc_c.value = row_acc
+                        acc_c.number_format = '0.0%'
+                        acc_c.alignment = Alignment(horizontal="right", vertical="center")
+
+                    for col_i in range(1, total_cols_count + 1):
                         c = ws_detail.cell(row=current_row, column=col_i)
-                        if col_i not in [4, 7] or (col_i == 4 and c0_match) or (col_i == 7 and c1_match):
-                            c.font = cls.REGULAR_FONT
+                        c.font = cls.HEADER_ROW_FONT if is_sys_row else cls.REGULAR_FONT
+                        if is_sys_row:
+                            c.fill = cls.HEADER_ROW_FILL
                         c.border = cls.THIN_BORDER
 
                     current_row += 1
-                    item_no += 1
+                    if not is_sys_row:
+                        item_no += 1
 
-                # ページタイトルの見出しセル装飾
-                p_acc_val = (page_matches / page_items * 100) if page_items > 0 else 100.0
-                t_cell = ws_detail.cell(row=title_row_idx, column=1, value=f"📄 {p_title}   【項目数: {page_items} | 正解数: {page_matches} | ページ正解率: {p_acc_val:.1f}%】")
+                subtotal_row = current_row
+                ws_detail.row_dimensions[subtotal_row].height = 22
+
+                ws_detail.cell(row=subtotal_row, column=1, value="小計").alignment = Alignment(horizontal="center", vertical="center")
+
+                total_page_items = sum(col_item_counts)
+                total_page_matches = sum(col_match_counts)
+
+                for c_i in range(max_c_count):
+                    start_c = 2 + (c_i * 3)
+                    
+                    ws_detail.cell(row=subtotal_row, column=start_c, value="")
+                    ws_detail.cell(row=subtotal_row, column=start_c + 1, value="")
+
+                    c_items = col_item_counts[c_i]
+                    c_matches = col_match_counts[c_i]
+                    
+                    j_text = f"{c_matches} / {c_items}" if c_items > 0 else "-"
+                    j_cell = ws_detail.cell(row=subtotal_row, column=start_c + 2, value=j_text)
+                    j_cell.alignment = Alignment(horizontal="center", vertical="center")
+
+                p_acc_val = (total_page_matches / total_page_items) if total_page_items > 0 else 1.0
+                p_acc_cell = ws_detail.cell(row=subtotal_row, column=total_cols_count, value=p_acc_val)
+                p_acc_cell.number_format = '0.0%'
+                p_acc_cell.alignment = Alignment(horizontal="right", vertical="center")
+
+                for col_i in range(1, total_cols_count + 1):
+                    c = ws_detail.cell(row=subtotal_row, column=col_i)
+                    c.fill = cls.SUBTOTAL_FILL
+                    c.font = cls.SUBTOTAL_FONT
+                    c.border = cls.THIN_BORDER
+
+                current_row += 1
+
+                p_acc_percent = (total_page_matches / total_page_items * 100) if total_page_items > 0 else 100.0
+                title_text = f"📄 {p_title}   【全 {total_page_items} 項目 | 正解: {total_page_matches} | ページ総合正解率: {p_acc_percent:.1f}%】"
+
+                t_cell = ws_detail.cell(row=title_row_idx, column=1, value=title_text)
                 t_cell.fill = cls.PAGE_TITLE_FILL
                 t_cell.font = cls.PAGE_TITLE_FONT
                 t_cell.alignment = Alignment(horizontal="left", vertical="center")
-                for c_idx in range(1, 9):
+                for c_idx in range(1, total_cols_count + 1):
                     ws_detail.cell(row=title_row_idx, column=c_idx).border = cls.THIN_BORDER
 
-            # 列幅の調整
-            ws_detail.column_dimensions['A'].width = 6
-            ws_detail.column_dimensions['B'].width = 28
-            ws_detail.column_dimensions['C'].width = 28
-            ws_detail.column_dimensions['D'].width = 10
-            ws_detail.column_dimensions['E'].width = 18
-            ws_detail.column_dimensions['F'].width = 18
-            ws_detail.column_dimensions['G'].width = 10
-            ws_detail.column_dimensions['H'].width = 12
+            ws_detail.column_dimensions['A'].width = 5
+            for c_i in range(max_c_count):
+                start_c = 2 + (c_i * 3)
+                if c_i == 0:
+                    ws_detail.column_dimensions[get_column_letter(start_c)].width = 28
+                    ws_detail.column_dimensions[get_column_letter(start_c + 1)].width = 28
+                else:
+                    ws_detail.column_dimensions[get_column_letter(start_c)].width = 18
+                    ws_detail.column_dimensions[get_column_letter(start_c + 1)].width = 18
+                
+                ws_detail.column_dimensions[get_column_letter(start_c + 2)].width = 8
+
+            ws_detail.column_dimensions[last_col_letter].width = 10
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         wb.save(output_path)
