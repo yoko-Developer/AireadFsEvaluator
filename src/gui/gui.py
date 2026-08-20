@@ -18,7 +18,7 @@ if os.path.exists(theme_path):
 
 # アプリのメインウィンドウ
 app = ctk.CTk()
-app.title("Airead 精度評価アプリ（ファイル別サマリー＆折りたたみ詳細）")
+app.title("Airead 精度評価アプリ")
 app.geometry("480x360")
 
 label_text = ctk.CTkLabel(
@@ -27,26 +27,25 @@ label_text = ctk.CTkLabel(
     font=("Hiragino Sans", 20, "bold")
 )
 label_text.pack(pady=60)
+
 def clean_text(val):
     """ノイズ（全角・半角スペース、カンマ、カッコなど）を除去する"""
-    text = str(val).replace(' ', '').replace(' ', '')
+    text = str(val).replace(' ', '')
     return re.sub(r'[【】\(\)（）※\*＊\s\t,、]', '', text)
 
 def detect_sheet_name(csv_path):
     """CSVの中身やファイル名から帳票タイトルを判定する"""
     file_name = os.path.basename(csv_path).lower()
 
-    # 本物データ（_detail.csv）のファイル名末尾による決定的な判定
-    if re.search(r'_0_detail(\.csv)?$', file_name):
+    if re.search(r'_0(_detail)?(\.csv)?$', file_name):
         return "貸借対照表"
-    elif re.search(r'_1_detail(\.csv)?$', file_name):
+    elif re.search(r'_1(_detail)?(\.csv)?$', file_name):
         return "損益計算書"
-    elif re.search(r'_2_detail(\.csv)?$', file_name):
+    elif re.search(r'_2(_detail)?(\.csv)?$', file_name):
         return "販売費及び一般管理費明細書"
-    elif re.search(r'_3_detail(\.csv)?$', file_name):
+    elif re.search(r'_3(_detail)?(\.csv)?$', file_name):
         return "株主資本等変動計算書"
 
-    # CSVの中身から判定
     try:
         with open(csv_path, "r", encoding="utf-8-sig") as f:
             content = f.read(1500)
@@ -63,9 +62,12 @@ def detect_sheet_name(csv_path):
     return "決算書帳票"
 
 def button_click():
+    # 実行ボタンを押したらボタンを消す（フェードアウト）
+    button.pack_forget()
+    
     label_text.configure(text="評価処理を実行中...")
     app.update()
-    # main.py（評価ロジック）を動かす
+
     project_root = pathutils.get_project_root_dir()
     config_path = str(project_root / ".azure-pipelines" / "config.toml")
 
@@ -78,108 +80,126 @@ def button_click():
     label_text.configure(text="ファイルレポートを作成中...")
     app.update()
 
-    # 2. 全結果ファイル (full_comparison_*.csv) を探索してPDF（ファイル）ごとにグループ化
-    results_dir = project_root / "results" / "fs" / "individual reports"
-
-    pdf_groups = {}  # { PDF基本名: [ページごとのデータ] }
-
+    # 実際の出力先(results/fs)から結果CSVを直接探索
+    results_dir = project_root / "results"
+    
+    pdf_groups = {}
     total_cumulative_items = 0
     passed_cumulative_items = 0
-    
+
+    target_files = []
     if results_dir.exists():
         for root, dirs, files in os.walk(results_dir):
-            # _detail.csvのみを対象にする
-            csv_files = sorted([f for f in files if "full_comparison" in f and f.endswith(".csv") and "_detail" in f])
-            
-            for file in csv_files:
-                target_csv = os.path.join(root, file)
-                sheet_title = detect_sheet_name(target_csv)
-                
-                # ファイル名からPDF名とページ番号を分解（例: ..._0_detail -> ページ1）
-                file_stem = file.replace("full_comparison_", "").replace("_detail.csv", "").replace(".csv", "")
+            for f in files:
+                # full_comparison または diff_list が含まれるCSVを収集
+                if f.endswith(".csv") and ("full_comparison" in f or "diff_list" in f):
+                    target_files.append(os.path.join(root, f))
 
-                page_idx_match = re.search(r'_(\d+)$', file_stem)
-                if page_idx_match:
-                    page_num = int(page_idx_match.group(1)) + 1
-                    pdf_base_name = re.sub(r'_\d+$', '', file_stem)
-                else:
-                    page_num = 1
-                    pdf_base_name = file_stem
+    # 万が一全探索で見つからない場合のバックアップ（direct_search）
+    if not target_files:
+        alt_dir = project_root / "results" / "fs" / "individual reports" / "csv"
+        if alt_dir.exists():
+            for root, dirs, files in os.walk(alt_dir):
+                for f in files:
+                    if f.endswith(".csv"):
+                        target_files.append(os.path.join(root, f))
 
-                page_items = []
-                page_total = 0
-                page_passed = 0
+    # 同名ファイルがあったら最新の更新日時のものを使用
+    latest_files_map = {}
+    for fp in target_files:
+        fn = os.path.basename(fp)
+        mtime = os.path.getmtime(fp)
+        if fn not in latest_files_map or mtime > latest_files_map[fn][1]:
+            latest_files_map[fn] = (fp, mtime)
 
-                with open(target_csv, "r", encoding="utf-8-sig") as f:
-                    reader = csv.DictReader(f)
-                    for idx, row in enumerate(reader, 1):
-                        item_gt = row.get("c0_gt", row.get("項目正解", ""))
-                        item_pd = row.get("c0_pd", row.get("項目読み取り", ""))
-                        amt_gt = row.get("c1_gt", "")
-                        amt_pd = row.get("c1_pd", "")
+    final_target_paths = [v[0] for v in latest_files_map.values()]
 
-                        # 空行スキップ
-                        if not item_gt and not item_pd and not amt_gt and not amt_pd:
-                            continue
+    for target_csv in final_target_paths:
+        file = os.path.basename(target_csv)
+        sheet_title = detect_sheet_name(target_csv)
+        
+        file_stem = file.replace("full_comparison_", "").replace("diff_list_", "").replace("_detail.csv", "").replace(".csv", "")
 
-                        correct_disp = f"{item_gt} ({amt_gt})" if amt_gt else item_gt
-                        recognized_disp = f"{item_pd} ({amt_pd})" if amt_pd else item_pd
+        page_idx_match = re.search(r'_(\d+)$', file_stem)
+        if page_idx_match:
+            page_num = int(page_idx_match.group(1)) + 1
+            pdf_base_name = re.sub(r'_\d+$', '', file_stem)
+        else:
+            page_num = 1
+            pdf_base_name = file_stem
 
-                        item_gt_clean = clean_text(item_gt)
-                        item_pd_clean = clean_text(item_pd)
-                        amt_gt_clean = clean_text(amt_gt)
-                        amt_pd_clean = clean_text(amt_pd)
+        page_items = []
+        page_total = 0
+        page_passed = 0
 
-                        accuracy_val = str(row.get("accuracy", row.get("一致", "0")))
+        try:
+            with open(target_csv, "r", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                for idx, row in enumerate(reader, 1):
+                    item_gt = row.get("c0_gt", row.get("正解(Ground Truth)", row.get("マスタデータ", row.get("項目正解", ""))))
+                    item_pd = row.get("c0_pd", row.get("推論(Prediction)", row.get("AIRead読み取り結果", row.get("項目読み取り", ""))))
+                    amt_gt = row.get("c1_gt", "")
+                    amt_pd = row.get("c1_pd", "")
 
-                        if (
-                            accuracy_val in ["100", "100.0", "True", "true", "1"] 
-                            or (item_gt_clean == item_pd_clean and amt_gt_clean == amt_pd_clean)
-                        ):
-                            is_ok = True
-                            page_passed += 1
-                        else:
-                            is_ok = False
+                    if not item_gt and not item_pd and not amt_gt and not amt_pd:
+                        continue
 
-                        page_total += 1
+                    correct_disp = f"{item_gt} ({amt_gt})" if amt_gt else item_gt
+                    recognized_disp = f"{item_pd} ({amt_pd})" if amt_pd else item_pd
 
-                        page_items.append({
-                            "no": idx,
-                            "correct": correct_disp,
-                            "recognized": recognized_disp,
-                            "is_ok": is_ok
-                        })
+                    item_gt_clean = clean_text(item_gt)
+                    item_pd_clean = clean_text(item_pd)
+                    amt_gt_clean = clean_text(amt_gt)
+                    amt_pd_clean = clean_text(amt_pd)
 
-                page_acc = (page_passed / page_total * 100) if page_total > 0 else 0
-                total_cumulative_items += page_total
-                passed_cumulative_items += page_passed
+                    accuracy_val = str(row.get("accuracy", row.get("一致", "0")))
 
-                if pdf_base_name not in pdf_groups:
-                    pdf_groups[pdf_base_name] = []
+                    if (
+                        accuracy_val in ["100", "100.0", "True", "true", "1"] 
+                        or (item_gt_clean == item_pd_clean and amt_gt_clean == amt_pd_clean)
+                    ):
+                        is_ok = True
+                        page_passed += 1
+                    else:
+                        is_ok = False
 
-                pdf_groups[pdf_base_name].append({
-                    "page_num": page_num,
-                    "sheet_title": sheet_title,
-                    "page_total": page_total,
-                    "page_passed": page_passed,
-                    "page_acc": page_acc,
-                    "items": page_items
-                })
+                    page_total += 1
 
-    # 累計精度
+                    page_items.append({
+                        "no": idx,
+                        "correct": correct_disp,
+                        "recognized": recognized_disp,
+                        "is_ok": is_ok
+                    })
+        except Exception as err:
+            print(f"❌ CSV読み込みエラー ({file}): {err}")
+
+        page_acc = (page_passed / page_total * 100) if page_total > 0 else 0
+        total_cumulative_items += page_total
+        passed_cumulative_items += page_passed
+
+        if pdf_base_name not in pdf_groups:
+            pdf_groups[pdf_base_name] = []
+
+        pdf_groups[pdf_base_name].append({
+            "page_num": page_num,
+            "sheet_title": sheet_title,
+            "page_total": page_total,
+            "page_passed": page_passed,
+            "page_acc": page_acc,
+            "items": page_items
+        })
+
     total_acc = (passed_cumulative_items / total_cumulative_items * 100) if total_cumulative_items > 0 else 0
 
-    # 3. PDF（ファイル）ごとにまとめたHTMLとExcel用データの生成
     pdf_cards_html = ""
-
-
-    excel_export_path = project_root / "results" / "fs" / "全ページ詳細明細_Excel用.csv"
+    excel_export_path = project_root / "results" / "全ページ詳細明細_Excel用.csv"
+    
     with open(excel_export_path, "w", encoding="utf-8-sig", newline="") as ef:
         writer = csv.writer(ef)
-        writer.writerow(["PDFファイル名", "ページ番号", "帳票タイトル", "No", "正解データ", "AIRead読み取り結果", "判定(1/0)"])
+        writer.writerow(["PDFファイル名", "ページ番号", "帳票タイトル", "No", "マスタデータ", "AIRead読み取り結果", "判定(1/0)"])
 
         for pdf_idx, (pdf_name, pages) in enumerate(pdf_groups.items(), 1):
-            
             pages = sorted(pages, key=lambda x: x["page_num"])
             
             pdf_total = sum(p["page_total"] for p in pages)
@@ -196,14 +216,12 @@ def button_click():
             
                 pages_summary_rows += f"""
                 <tr>
-
                     <td style="text-align:center;">ページ {p['page_num']}</td>
                     <td style="font-weight:bold; color:#ff7bd5;">{p['sheet_title']}</td>
                     <td style="text-align:center;">{p['page_passed']} / {p['page_total']} 項目</td>
                     <td class="{p_acc_class}" style="text-align:center;">{p['page_acc']:.1f}%</td>
                 </tr>
                 """
-
 
                 item_rows_html = ""
                 for item in p["items"]:
@@ -238,7 +256,7 @@ def button_click():
                         <thead>
                             <tr>
                                 <th style="width: 8%; text-align:center;">No</th>
-                                <th style="width: 42%;">正解データ (Ground Truth)</th>
+                                <th style="width: 42%;">マスタデータ</th>
                                 <th style="width: 42%;">AIRead 読み取り結果</th>
                                 <th style="width: 8%; text-align:center;">判定</th>
                             </tr>
@@ -258,7 +276,7 @@ def button_click():
                         <span class="pdf-sub">({len(pages)} ページ構成)</span>
                     </div>
                     <div class="pdf-score">
-                        全体の正解率: <span class="{pdf_acc_class}">{pdf_acc:.1f}%</span> ({pdf_passed}/{pdf_total})
+                        正解率: <span class="{pdf_acc_class}">{pdf_acc:.1f}%</span> ({pdf_passed}/{pdf_total})
                         <span class="arrow-icon">▼ クリックで詳細</span>
                     </div>
                 </div>
@@ -286,8 +304,7 @@ def button_click():
             </div>
             """
 
-    # 4. HTMLレポートの組み立てと生成
-    output_html_dir = project_root / "results" / "fs"
+    output_html_dir = project_root / "results"
     output_html_dir.mkdir(parents=True, exist_ok=True)
     html_path = str(output_html_dir / "gui_pdf_summary_report.html")
 
@@ -480,7 +497,7 @@ def button_click():
         </div>
         <div class="stat">
             <div class="stat-value pink">{total_acc:.1f}%</div>
-            <div class="stat-label">Cumulative Accuracy (全体累計)</div>
+            <div class="stat-label">Cumulative Accuracy (正解率)</div>
         </div>
     </div>
 
@@ -510,4 +527,4 @@ button = ctk.CTkButton(
 )
 button.pack(pady=20)
 
-app.mainloop() 
+app.mainloop()

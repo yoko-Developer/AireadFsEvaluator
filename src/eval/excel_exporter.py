@@ -8,7 +8,7 @@ from openpyxl.utils import get_column_letter
 
 class KessanExcelExporter:
     """
-    決算5表評価結果をセル単位比較Excelとして出力するクラス（ブランク対応＆安全取得版）
+    決算5表評価結果をセル単位比較Excelとして出力するクラス（formidによる動的タイトル決定対応版）
     """
 
     PASTEL_PINK_FILL = PatternFill(start_color="F875DD", end_color="F875DD", fill_type="solid")
@@ -43,6 +43,15 @@ class KessanExcelExporter:
 
     SYSTEM_KEYS = {"page", "formid", "account", "amount_0", "amount_1", "amount_2", "amount_3", "amount", "金額"}
 
+    # formidから帳票タイトルへのマッピング
+    FORM_ID_MAP = {
+        "01_010_02": "貸借対照表 (BS)",
+        "01_020_02": "損益計算書 (PL)",
+        "01_030_02": "製造原価報告書",
+        "01_040_02": "販売費及び一般管理費明細書",
+        "01_050_02": "株主資本等変動計算書"
+    }
+
     @classmethod
     def clean_str(cls, val: Any) -> str:
         if pd.isna(val) or val is None:
@@ -64,6 +73,20 @@ class KessanExcelExporter:
         return clean_gt in cls.SYSTEM_KEYS or clean_pd in cls.SYSTEM_KEYS
 
     @classmethod
+    def get_title_from_df(cls, df_page: pd.DataFrame, default_title: str) -> str:
+        """DataFrame内の全セルからformidを検索し、正しい帳票名を取得する"""
+        try:
+            for col in df_page.columns:
+                for val in df_page[col].dropna():
+                    clean_v = cls.clean_str(val)
+                    for f_id, f_name in cls.FORM_ID_MAP.items():
+                        if f_id in clean_v:
+                            return f_name
+        except Exception:
+            pass
+        return default_title
+    
+    @classmethod
     def export_kessan_report(
         cls, 
         output_path: Path, 
@@ -83,7 +106,7 @@ class KessanExcelExporter:
 
         headers = [
             "No", "PDFファイル名", "総ページ数", "総項目数", "総正解数", "全体正解率",
-            "BS", "PL", "販管費", "株主資本", "製造原価"
+            "BS", "PL", "製造原価", "販管費", "株主資本"
         ]
 
         for col_idx, header in enumerate(headers, start=1):
@@ -98,9 +121,9 @@ class KessanExcelExporter:
         kessan_map = {
             "BS": ["BS", "BS_acc", "貸借対照表", "貸借対照表_acc"],
             "PL": ["PL", "PL_acc", "損益計算書", "損益計算書_acc"],
-            "販管費": ["販管費", "販管費_acc", "販売費及び一般管理費明細書", "販売費及び一般管理費明細書_acc", "販売費及び一般管理費", "販売費及び一般管理費_acc"],
-            "株主資本": ["株主資本", "株主資本_acc", "株主資本等変動計算書", "株主資本等変動計算書_acc"],
-            "製造原価": ["製造原価", "製造原価_acc", "製造原価報告書", "製造原価報告書_acc"]
+            "製造原価": ["製造原価", "製造原価_acc", "製造原価報告書", "製造原価報告書_acc"],
+            "販管費": ["販管費", "販管費_acc", "販売費及び一般管理費明細書", "販売費及び一般管理費明細書_acc"],
+            "株主資本": ["株主資本", "株主資本_acc", "株主資本等変動計算書", "株主資本等変動計算書_acc"]
         }
 
         row_idx = 3
@@ -125,7 +148,7 @@ class KessanExcelExporter:
             acc_cell.number_format = '0.0%'
             acc_cell.alignment = Alignment(horizontal="center", vertical="center")
 
-            kessan_types = ["BS", "PL", "販管費", "株主資本", "製造原価"]
+            kessan_types = ["BS", "PL", "製造原価", "販管費", "株主資本"]
             for c_offset, k_type in enumerate(kessan_types, start=7):
                 status_val = "-"
                 for alt_key in kessan_map[k_type]:
@@ -241,7 +264,10 @@ class KessanExcelExporter:
 
             current_row = 3
 
-            for p_title, df_page in page_df_list:
+            for raw_p_title, df_page in page_df_list:
+                # ★formidから正解の帳票タイトルを動的に決定★
+                p_title = cls.get_title_from_df(df_page, raw_p_title)
+
                 title_row_idx = current_row
                 ws_detail.merge_cells(start_row=title_row_idx, start_column=1, end_row=title_row_idx, end_column=total_cols_count)
                 ws_detail.row_dimensions[title_row_idx].height = 22
@@ -251,7 +277,6 @@ class KessanExcelExporter:
                 col_item_counts = [0] * max_c_count
                 col_match_counts = [0] * max_c_count
 
-                # ★安全な辞書変換でエラー回避★
                 for _, row_series in df_page.iterrows():
                     row_dict = row_series.to_dict()
 
@@ -286,13 +311,13 @@ class KessanExcelExporter:
 
                         ws_detail.cell(row=current_row, column=start_c, value=gt_val_raw).alignment = Alignment(horizontal=align_gt, vertical="center")
                         ws_detail.cell(row=current_row, column=start_c + 1, value=pd_val_raw).alignment = Alignment(horizontal=align_pd, vertical="center")
+
                         judge_cell = ws_detail.cell(row=current_row, column=start_c + 2)
                         judge_cell.alignment = Alignment(horizontal="center", vertical="center")
 
                         if is_sys_row:
                             judge_cell.value = "-"
                         else:
-                            # ★両方空欄（値がない）場合はブランクにする！★
                             if not norm_gt and not norm_pd:
                                 judge_cell.value = ""
                             else:

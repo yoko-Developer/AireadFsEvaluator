@@ -15,9 +15,18 @@ from src.eval.excel_exporter import KessanExcelExporter
 
 class Csv4dbEvaluator:
     """
-    CSV4DB形式で出力したAIReadの結果ファイルと正解データファイル(Ground Truth)を比較し、
-    精度指標の算出および差分レポート(CSV/HTML)を出力するクラス
+    CSV4DB形式で出力したAIReadResultファイルと正解データファイル(Ground Truth)を比較し、
+    精度指標の算出および差分レポート(CSV/HTML/Excel)を出力するクラス
     """
+
+    # ★formidから帳票タイトルへのマッピング定数★
+    FORM_ID_MAP = {
+        "01_010_02": "貸借対照表 (BS)",
+        "01_020_02": "損益計算書 (PL)",
+        "01_030_02": "製造原価報告書",
+        "01_040_02": "販売費及び一般管理費明細書",
+        "01_050_02": "株主資本等変動計算書"
+    }
 
     def __init__(self, session: str, prediction_dir: Path, ground_truth_dir: Path, results_base_dir: Path) -> None:
         self.session: str = session
@@ -93,14 +102,11 @@ class Csv4dbEvaluator:
             gt_df, pd_df = self._align_rows_by_fuzzy_match(gt_df, pd_df)
             # 正解データと対象データをマージ
             merged_df = pandas.merge(gt_df, pd_df, on='row_id', how='outer', indicator='row_presence', validate="many_to_many").fillna('')
+            
             # --- マージ後は行順が辞書順になってしまうので、行順を[r1, r2,..., r10, r11,...]のように自然にするために並び替え ---
-            # 1. 数字部分だけを抽出して数値(int)にする（r2 や extra_r2 から "2" を取り出す）
             merged_df['r_num'] = merged_df['row_id'].str.extract(r'(\d+)').astype(int)
-            # 2. 'extra' から始まるかどうかを判定する (False=0, True=1 になるので、r が先に来る)
             merged_df['r_has_extra'] = merged_df['row_id'].str.startswith('extra').astype(int)
-            # 3. 「数字」→「extraかどうか」の順でソート
             merged_df = merged_df.sort_values(by=['r_num', 'r_has_extra'])
-            # 4. 作業用カラムを削除してインデックスを振り直す
             merged_df = merged_df.drop(columns=['r_num', 'r_has_extra']).reset_index(drop=True)
 
             # 精度計算
@@ -152,6 +158,9 @@ class Csv4dbEvaluator:
                     ss_acc = "-"
                     seizo_acc = "-"
 
+                    # ★直前の検出タイトルを記憶する変数★
+                    last_detected_title = None
+
                     for page_file_name, df in page_list:
                         # 明細データ(_detail)または比較DataFrame
                         if "_detail" in page_file_name or "c0_gt" in df.columns:
@@ -164,26 +173,25 @@ class Csv4dbEvaluator:
 
                             p_acc_num = round((match_sum / item_sum * 100), 1) if item_sum > 0 else 100.0
 
-                            # ページ番号（_0_, _1_, _2_, _3_）による帳票判定
-                            if re.search(r'_0(_detail)?\.csv$', page_file_name):
-                                p_title = "貸借対照表 (BS)"
-                                bs_acc = p_acc_num
-                            elif re.search(r'_1(_detail)?\.csv$', page_file_name):
-                                p_title = "損益計算書 (PL)"
-                                pl_acc = p_acc_num
-                            elif re.search(r'_2(_detail)?\.csv$', page_file_name):
-                                p_title = "販売費及び一般管理費明細書"
-                                sg_acc = p_acc_num  # ★ _2.csv は絶対に販管費！
-                            elif re.search(r'_3(_detail)?\.csv$', page_file_name):
-                                p_title = "株主資本等変動計算書"
-                                ss_acc = p_acc_num
-                            elif "製造" in page_file_name or "原価" in page_file_name:
-                                p_title = "製造原価明細書"
-                                seizo_acc = p_acc_num
+                            # ★formidを検知。無ければ「直前のタイトル」をそのまま継承！★
+                            detected_title = self._detect_title_by_formid(df)
+                            if detected_title:
+                                last_detected_title = detected_title
                             else:
-                                p_title = f"決算書 ({page_file_name})"
+                                detected_title = last_detected_title if last_detected_title else f"決算書 ({page_file_name})"
 
-                            page_df_list.append((p_title, df))
+                            if detected_title == "貸借対照表 (BS)":
+                                bs_acc = p_acc_num
+                            elif detected_title == "損益計算書 (PL)":
+                                pl_acc = p_acc_num
+                            elif detected_title == "製造原価報告書":
+                                seizo_acc = p_acc_num
+                            elif detected_title == "販売費及び一般管理費明細書":
+                                sg_acc = p_acc_num
+                            elif detected_title == "株主資本等変動計算書":
+                                ss_acc = p_acc_num
+
+                            page_df_list.append((detected_title, df))
 
                     acc = round((total_matches / total_items * 100), 2) if total_items > 0 else 0.0
 
@@ -211,7 +219,20 @@ class Csv4dbEvaluator:
 
         else:
             logging.warning("❌ 評価対象データが見つかりません。")
-            
+
+    def _detect_title_by_formid(self, df: pandas.DataFrame) -> Optional[str]:
+        """データフレームの全セルからformid（01_010_02等）を検出し、正しい帳票タイトルを返す"""
+        try:
+            for col in df.columns:
+                for val in df[col].dropna():
+                    v_str = str(val).strip()
+                    for f_id, title in self.FORM_ID_MAP.items():
+                        if f_id in v_str:
+                            return title
+        except Exception:
+            pass
+        return None
+
     # ==========================================
     # CSV読み込み
     # ==========================================
@@ -223,28 +244,22 @@ class Csv4dbEvaluator:
             try:
                 enc = fileutils.detect_encoding(file_path)
                 
-                # csv.reader を使ってダブルクォーテーション内のカンマを保護しながら行をパース
                 rows = []
                 with open(file_path, 'r', encoding=enc, newline='') as f:
                     reader = csv.reader(f)
                     for row in reader:
-                        if row:  # 空行スキップ
+                        if row:
                             rows.append([str(cell).strip() for cell in row])
 
                 if not rows:
                     return pandas.DataFrame()
 
-                # 最大列数を計算
                 max_cols = max(len(r) for r in rows)
-
-                # 全行の列数を揃える
                 padded_rows = [r + [''] * (max_cols - len(r)) for r in rows]
 
-                # 1行目をヘッダーとする
                 headers = padded_rows[0]
                 data_rows = padded_rows[1:]
 
-                # カラム名の一意化処理
                 col_names = []
                 counts = {}
                 for idx, h in enumerate(headers):
@@ -319,22 +334,18 @@ class Csv4dbEvaluator:
 
 
     def _create_column_profiles(self, df: pandas.DataFrame, cols: List[str], max_len: int = 1500) -> List[str]:
-        """列のヘッダーとデータを結合し、列の特徴を表す文字列(プロファイル)を生成する"""
         profiles = []
-
         for col_name in cols:
             valid_data = df[col_name].dropna().astype(str)
             data_str = "".join(valid_data)
             normalized_str = self._normalize_text(col_name + data_str)
             profiles.append(normalized_str[:max_len])
-
         return profiles
 
 
     def _calculate_column_similarity_scores(
         self, gt_cols: List[str], gt_profs: List[str], pd_cols: List[str], pd_profs: List[str]
     ) -> List[Dict[str, float]]:
-        """GTとPDの全列の組み合わせに対して類似度スコアを計算する"""
         scored_matches = []
         for gt_idx, (gt_col, gt_profile) in enumerate(zip(gt_cols, gt_profs)):
             gt_header_norm = self._normalize_text(gt_col)
@@ -357,7 +368,6 @@ class Csv4dbEvaluator:
 
 
     def _determine_column_mapping(self, sorted_matches: List[Dict[str, float]], pd_cols: List[str]) -> Dict[str, str]:
-        """スコアの高い順に列の紐付け（1対1）を確定する"""
         mapping = {}
         matched_gt, matched_pd = set(), set()
 
@@ -372,7 +382,6 @@ class Csv4dbEvaluator:
 
 
     def _insert_headers_as_data_row(self, df: pandas.DataFrame, original_headers: List[str]) -> None:
-        """元のヘッダー名をインデックス -1 のデータ行として挿入する"""
         padding = [""] * (len(df.columns) - len(original_headers))
         df.loc[-1] = original_headers + padding
         df.index = df.index + 1
@@ -383,7 +392,6 @@ class Csv4dbEvaluator:
     # 行の紐付け (Row Alignment)
     # ==========================================
     def _align_rows_by_fuzzy_match(self, gt_df: pandas.DataFrame, pd_df: pandas.DataFrame) -> Tuple[pandas.DataFrame, pandas.DataFrame]:
-        """近似マッチングを用いて、正解行と推論行を紐付けたDataFrameを作成する"""
         gt_norm = gt_df.apply(lambda r: self._normalize_text(''.join(r.dropna().astype(str))), axis=1).tolist()
         pd_norm = pd_df.apply(lambda r: self._normalize_text(''.join(r.dropna().astype(str))), axis=1).tolist()
 
@@ -434,7 +442,6 @@ class Csv4dbEvaluator:
     # 個別レポート生成 (individual Report)
     # ==========================================
     def _save_individual_reports(self, diff_df: pandas.DataFrame, merged_df: pandas.DataFrame, file_name: str) -> None:
-        """個別ファイルの差分結果を、用途別のCSV群とHTMLで保存する"""
         file_stem = Path(file_name).stem
 
         individual_dir = self.session_dir / "individual reports"
@@ -486,8 +493,8 @@ class Csv4dbEvaluator:
             merge_status = row.get('row_presence', 'both')
 
             for col in ordered_cols:
-                gt_val = str(row.get(f"{col}_gt", "")).replace(' ', '').replace(' ', '').strip()
-                pd_val = str(row.get(f"{col}_pd", "")).replace(' ', '').replace(' ', '').strip()
+                gt_val = str(row.get(f"{col}_gt", "")).replace(' ', '').strip()
+                pd_val = str(row.get(f"{col}_pd", "")).replace(' ', '').strip()
                 
                 if gt_val == pd_val:
                     continue
@@ -657,7 +664,6 @@ class Csv4dbEvaluator:
     def _normalize_text(text: str) -> str:
         """★カンマもピリオドも一切消さない！スペース（空白・タブ・全角空白）のみを除去して100%厳格評価★"""
         text_str = str(text or '')
-        # カンマ(,)やピリオド(.)は消さずにそのまま比較し、半角・全角スペースとタブのみを除去する！
         return re.sub(r'[\s\t\u3000]', '', text_str)
 
     @staticmethod
