@@ -105,9 +105,11 @@ class KessanExcelExporter:
         ws_matrix.cell(row=1, column=1, value="決算5表 精度評価マトリックスレポート").font = cls.TITLE_FONT
 
         headers = [
-            "No", "PDFファイル名", "総ページ数", "総項目数", "総正解数", "全体正解率",
+            "No", "PDFファイル名", "総ページ数",
+            "分類正解数", "分類総数", "分類正解率",
+            "OCR総項目数", "OCR正解数", "OCR正解率",
             "BS", "PL", "製造原価", "販管費", "株主資本"
-        ]
+]
 
         for col_idx, header in enumerate(headers, start=1):
             cell = ws_matrix.cell(row=2, column=col_idx, value=header)
@@ -135,21 +137,43 @@ class KessanExcelExporter:
             c3.number_format = '#,##0'
             c3.alignment = Alignment(horizontal="center", vertical="center")
 
-            c4 = ws_matrix.cell(row=row_idx, column=4, value=data.get("total_items", 0))
+            # 分類
+            c4 = ws_matrix.cell(row=row_idx, column=4, value=data.get("classification_matches", 0))
             c4.number_format = '#,##0'
             c4.alignment = Alignment(horizontal="center", vertical="center")
 
-            c5 = ws_matrix.cell(row=row_idx, column=5, value=data.get("total_matches", 0))
+            c5 = ws_matrix.cell(row=row_idx, column=5, value=data.get("classification_total", 0))
             c5.number_format = '#,##0'
             c5.alignment = Alignment(horizontal="center", vertical="center")
-            
-            acc = data.get("accuracy", 0.0) / 100.0 if data.get("accuracy", 0.0) > 1 else data.get("accuracy", 0.0)
-            acc_cell = ws_matrix.cell(row=row_idx, column=6, value=acc)
-            acc_cell.number_format = '0.0%'
-            acc_cell.alignment = Alignment(horizontal="center", vertical="center")
 
+            classification_total = data.get("classification_total", 0)
+            classification_matches = data.get("classification_matches", 0)
+            classification_acc = (
+                classification_matches / classification_total
+                if classification_total > 0
+                else 0
+            )
+
+            c6 = ws_matrix.cell(row=row_idx, column=6, value=classification_acc)
+            c6.number_format = '0.0%'
+            c6.alignment = Alignment(horizontal="center", vertical="center")
+
+            # OCR
+            c7 = ws_matrix.cell(row=row_idx, column=7, value=data.get("total_items", 0))
+            c7.number_format = '#,##0'
+            c7.alignment = Alignment(horizontal="center", vertical="center")
+
+            c8 = ws_matrix.cell(row=row_idx, column=8, value=data.get("total_matches", 0))
+            c8.number_format = '#,##0'
+            c8.alignment = Alignment(horizontal="center", vertical="center")
+
+            ocr_acc = data.get("accuracy", 0.0) / 100.0
+            c9 = ws_matrix.cell(row=row_idx, column=9, value=ocr_acc)
+            c9.number_format = '0.0%'
+            c9.alignment = Alignment(horizontal="center", vertical="center")
+            
             kessan_types = ["BS", "PL", "製造原価", "販管費", "株主資本"]
-            for c_offset, k_type in enumerate(kessan_types, start=7):
+            for c_offset, k_type in enumerate(kessan_types, start=10):
                 status_val = "-"
                 for alt_key in kessan_map[k_type]:
                     if alt_key in data:
@@ -174,27 +198,83 @@ class KessanExcelExporter:
             
         total_row = row_idx
         ws_matrix.cell(row=total_row, column=1, value="")
-        ws_matrix.cell(row=total_row, column=2, value="【 累計合計/平均 】").alignment = Alignment(horizontal="center", vertical="center")
-        
-        c3_tot = ws_matrix.cell(row=total_row, column=3, value=f"=SUM(C3:C{total_row-1})")
+        ws_matrix.cell(
+            row=total_row,
+            column=2,
+            value="【 累計合計/平均 】"
+        ).alignment = Alignment(horizontal="center", vertical="center")
+
+        # 総ページ数
+        c3_tot = ws_matrix.cell(
+            row=total_row,
+            column=3,
+            value=f"=SUM(C3:C{total_row-1})"
+        )
         c3_tot.number_format = '#,##0'
         c3_tot.alignment = Alignment(horizontal="center", vertical="center")
 
-        c4_tot = ws_matrix.cell(row=total_row, column=4, value=f"=SUM(D3:D{total_row-1})")
+        # 分類正解数
+        c4_tot = ws_matrix.cell(
+            row=total_row,
+            column=4,
+            value=f"=SUM(D3:D{total_row-1})"
+        )
         c4_tot.number_format = '#,##0'
         c4_tot.alignment = Alignment(horizontal="center", vertical="center")
 
-        c5_tot = ws_matrix.cell(row=total_row, column=5, value=f"=SUM(E3:E{total_row-1})")
+        # 分類総数
+        c5_tot = ws_matrix.cell(
+            row=total_row,
+            column=5,
+            value=f"=SUM(E3:E{total_row-1})"
+        )
         c5_tot.number_format = '#,##0'
         c5_tot.alignment = Alignment(horizontal="center", vertical="center")
-        
-        tot_acc_cell = ws_matrix.cell(row=total_row, column=6, value=f"=IF(D{total_row}>0, E{total_row}/D{total_row}, 0)")
-        tot_acc_cell.number_format = '0.0%'
-        tot_acc_cell.alignment = Alignment(horizontal="center", vertical="center")
 
-        col_letters = ['G', 'H', 'I', 'J', 'K']
+        # 分類正解率
+        classification_tot_acc = ws_matrix.cell(
+            row=total_row,
+            column=6,
+            value=f"=IF(E{total_row}>0,D{total_row}/E{total_row},0)"
+        )
+        classification_tot_acc.number_format = '0.0%'
+        classification_tot_acc.alignment = Alignment(horizontal="center", vertical="center")
+
+        # OCR総項目数
+        c7_tot = ws_matrix.cell(
+            row=total_row,
+            column=7,
+            value=f"=SUM(G3:G{total_row-1})"
+        )
+        c7_tot.number_format = '#,##0'
+        c7_tot.alignment = Alignment(horizontal="center", vertical="center")
+
+        # OCR正解数
+        c8_tot = ws_matrix.cell(
+            row=total_row,
+            column=8,
+            value=f"=SUM(H3:H{total_row-1})"
+        )
+        c8_tot.number_format = '#,##0'
+        c8_tot.alignment = Alignment(horizontal="center", vertical="center")
+
+        # OCR正解率
+        ocr_tot_acc = ws_matrix.cell(
+            row=total_row,
+            column=9,
+            value=f"=IF(G{total_row}>0,H{total_row}/G{total_row},0)"
+        )
+        ocr_tot_acc.number_format = '0.0%'
+        ocr_tot_acc.alignment = Alignment(horizontal="center", vertical="center")
+
+        # 帳票別平均
+        col_letters = ['J', 'K', 'L', 'M', 'N']
+
         for c_let in col_letters:
-            col_cell = ws_matrix.cell(row=total_row, column=openpyxl.utils.column_index_from_string(c_let))
+            col_cell = ws_matrix.cell(
+                row=total_row,
+                column=openpyxl.utils.column_index_from_string(c_let)
+            )
             col_cell.value = f'=IFERROR(AVERAGE({c_let}3:{c_let}{total_row-1}), "-")'
             col_cell.number_format = '0.0%'
             col_cell.alignment = Alignment(horizontal="center", vertical="center")
@@ -211,6 +291,9 @@ class KessanExcelExporter:
         ws_matrix.column_dimensions['D'].width = 12
         ws_matrix.column_dimensions['E'].width = 12
         ws_matrix.column_dimensions['F'].width = 14
+        ws_matrix.column_dimensions['G'].width = 14
+        ws_matrix.column_dimensions['H'].width = 12
+        ws_matrix.column_dimensions['I'].width = 12
 
         for c_letter in col_letters:
             ws_matrix.column_dimensions[c_letter].width = 16
@@ -327,7 +410,7 @@ class KessanExcelExporter:
                                     judge_cell.fill = cls.ALERT_FILL
                                     judge_cell.font = cls.ALERT_FONT
 
-                                if gt_val_raw:
+                                if gt_val_raw or pd_val_raw:
                                     row_total_cells += 1
                                     col_item_counts[c_i] += 1
                                     if is_match:

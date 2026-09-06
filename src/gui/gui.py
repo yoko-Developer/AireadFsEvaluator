@@ -61,13 +61,42 @@ def detect_sheet_name(csv_path):
         pass
     return "決算書帳票"
 
-def button_click():
-    # 実行ボタンを押したらボタンを消す（フェードアウト）
-    button.pack_forget()
-    
-    label_text.configure(text="評価処理を実行中...")
-    app.update()
+def fade_out_button(step=0):
+    colors = [
+        "#ff4fc3",
+        "#e846b1",
+        "#cc3d9f",
+        "#a93487",
+        "#84296c",
+        "#5e1f50",
+        "#3a1837",
+        "#1f141f",
+        "#121212",
+    ]
 
+    if step < len(colors):
+        button.configure(
+            fg_color=colors[step],
+            hover_color=colors[step],
+            text_color=colors[step]
+        )
+        app.after(100, lambda: fade_out_button(step + 1))
+    else:
+        button.pack_forget()
+        label_text.configure(
+            text="✦ 評価処理を実行中… ✦",
+            font=("Hiragino Sans", 20, "bold")
+        )
+        app.update()
+        app.after(100, run_evaluation_process)
+
+
+def button_click():
+    button.configure(state="disabled")
+    fade_out_button()
+
+
+def run_evaluation_process():
     project_root = pathutils.get_project_root_dir()
     config_path = str(project_root / ".azure-pipelines" / "config.toml")
 
@@ -84,15 +113,21 @@ def button_click():
     results_dir = project_root / "results"
     
     pdf_groups = {}
+
+    # OCR値評価
     total_cumulative_items = 0
     passed_cumulative_items = 0
+
+    # 分類評価
+    classification_total = 0
+    classification_passed = 0
 
     target_files = []
     if results_dir.exists():
         for root, dirs, files in os.walk(results_dir):
             for f in files:
                 # full_comparison または diff_list が含まれるCSVを収集
-                if f.endswith(".csv") and ("full_comparison" in f or "diff_list" in f):
+                if f.endswith(".csv") and ("full_comparison" in f):
                     target_files.append(os.path.join(root, f))
 
     # 万が一全探索で見つからない場合のバックアップ（direct_search）
@@ -116,18 +151,120 @@ def button_click():
 
     for target_csv in final_target_paths:
         file = os.path.basename(target_csv)
-        sheet_title = detect_sheet_name(target_csv)
-        
-        file_stem = file.replace("full_comparison_", "").replace("diff_list_", "").replace("_detail.csv", "").replace(".csv", "")
 
-        page_idx_match = re.search(r'_(\d+)$', file_stem)
+        # _detail.csv はOCR値評価、それ以外は分類評価
+        is_detail = "_detail" in file
+
+        file_stem = (
+            file
+            .replace("full_comparison_", "")
+            .replace("diff_list_", "")
+            .replace(".csv", "")
+        )
+
+        # ページ番号を取るため、detailだけ末尾を外す
+        page_stem = file_stem.replace("_detail", "")
+
+        page_idx_match = re.search(r'_(\d+)$', page_stem)
         if page_idx_match:
             page_num = int(page_idx_match.group(1)) + 1
-            pdf_base_name = re.sub(r'_\d+$', '', file_stem)
+            pdf_base_name = re.sub(r'_\d+$', '', page_stem)
         else:
             page_num = 1
-            pdf_base_name = file_stem
+            pdf_base_name = page_stem
 
+        if pdf_base_name not in pdf_groups:
+            pdf_groups[pdf_base_name] = []
+
+        # 同じPDF・同じ実ページを探す
+        page_data = next(
+            (
+                p for p in pdf_groups[pdf_base_name]
+                if p["page_num"] == page_num
+            ),
+            None
+        )
+
+        # 初めて出てきた実ページなら作成
+        if page_data is None:
+            page_data = {
+                "page_num": page_num,
+                "sheet_title": "決算書帳票",
+
+                # 分類評価
+                "classification_total": 0,
+                "classification_passed": 0,
+                "classification_gt": "",
+                "classification_pd": "",
+
+                # OCR値評価
+                "page_total": 0,
+                "page_passed": 0,
+                "page_acc": 0,
+                "items": []
+            }
+
+            pdf_groups[pdf_base_name].append(page_data)
+
+        # --------------------------------
+        # 分類評価（通常の .csv）
+        # --------------------------------
+        if not is_detail:
+            gt_formid = ""
+            pd_formid = ""
+
+            try:
+                with open(target_csv, "r", encoding="utf-8-sig") as f:
+                    reader = csv.DictReader(f)
+
+                    for row in reader:
+                        gt = str(row.get("c1_gt", "") or "").strip()
+                        pd = str(row.get("c1_pd", "") or "").strip()
+
+                        # "formid" という見出し行ではなく、
+                        # 実際の formid の行を取得する
+                        if gt and gt != "formid":
+                            gt_formid = gt
+                            pd_formid = pd
+                            break
+
+            except Exception as err:
+                print(f"❌ 分類CSV読み込みエラー ({file}): {err}")
+
+            classification_ok = (
+                gt_formid != ""
+                and gt_formid == pd_formid
+            )
+
+            page_data["classification_total"] = 1
+            page_data["classification_passed"] = 1 if classification_ok else 0
+            page_data["classification_gt"] = gt_formid
+            page_data["classification_pd"] = pd_formid
+
+            classification_total += 1
+            if classification_ok:
+                classification_passed += 1
+
+            # GTのformidから帳票名を決める
+            form_id_map = {
+                "01_010_02": "貸借対照表",
+                "01_020_02": "損益計算書",
+                "01_030_02": "製造原価報告書",
+                "01_040_02": "販売費及び一般管理費明細書",
+                "01_050_02": "株主資本等変動計算書",
+            }
+
+            page_data["sheet_title"] = form_id_map.get(
+                gt_formid,
+                "決算書帳票"
+            )
+
+            # 分類CSVはOCR値の集計には入れない
+            continue
+
+        # --------------------------------
+        # OCR値評価（_detail.csv）
+        # --------------------------------
         page_items = []
         page_total = 0
         page_passed = 0
@@ -135,35 +272,59 @@ def button_click():
         try:
             with open(target_csv, "r", encoding="utf-8-sig") as f:
                 reader = csv.DictReader(f)
-                for idx, row in enumerate(reader, 1):
-                    item_gt = row.get("c0_gt", row.get("正解(Ground Truth)", row.get("マスタデータ", row.get("項目正解", ""))))
-                    item_pd = row.get("c0_pd", row.get("推論(Prediction)", row.get("AIRead読み取り結果", row.get("項目読み取り", ""))))
-                    amt_gt = row.get("c1_gt", "")
-                    amt_pd = row.get("c1_pd", "")
 
-                    if not item_gt and not item_pd and not amt_gt and not amt_pd:
+                for idx, row in enumerate(reader, 1):
+                    # CSVのヘッダー行はHTMLにも表示しない
+                    if str(row.get("row_id", "")).strip() == "r0":
+                        continue
+                    
+                    # c0, c1, c2... の採点対象列を全部表示する
+                    column_numbers = sorted({
+                        int(m.group(1))
+                        for key in row.keys()
+                        if (m := re.fullmatch(r"c(\d+)_gt", key))
+                    })
+
+                    gt_parts = []
+                    pd_parts = []
+
+                    for col_num in column_numbers:
+                        gt_val = str(row.get(f"c{col_num}_gt", "") or "").strip()
+                        pd_val = str(row.get(f"c{col_num}_pd", "") or "").strip()
+
+                        # GTもPredictionも空なら表示しない
+                        if not gt_val and not pd_val:
+                            continue
+
+                        if col_num == 0:
+                            label = "項目"
+                        else:
+                            label = f"値{col_num}"
+
+                        gt_parts.append(f"{label}: {gt_val}")
+                        pd_parts.append(f"{label}: {pd_val}")
+
+                    # 採点対象セルが何もない行は表示しない
+                    if not gt_parts and not pd_parts:
                         continue
 
-                    correct_disp = f"{item_gt} ({amt_gt})" if amt_gt else item_gt
-                    recognized_disp = f"{item_pd} ({amt_pd})" if amt_pd else item_pd
+                    correct_disp = " ／ ".join(gt_parts)
+                    recognized_disp = " ／ ".join(pd_parts)
 
-                    item_gt_clean = clean_text(item_gt)
-                    item_pd_clean = clean_text(item_pd)
-                    amt_gt_clean = clean_text(amt_gt)
-                    amt_pd_clean = clean_text(amt_pd)
+                    accuracy_val = str(row.get("accuracy", "0"))
 
-                    accuracy_val = str(row.get("accuracy", row.get("一致", "0")))
+                    row_item_count = int(
+                        float(row.get("item_count", 0) or 0)
+                    )
 
-                    if (
-                        accuracy_val in ["100", "100.0", "True", "true", "1"] 
-                        or (item_gt_clean == item_pd_clean and amt_gt_clean == amt_pd_clean)
-                    ):
-                        is_ok = True
-                        page_passed += 1
-                    else:
-                        is_ok = False
+                    row_match_count = int(
+                        float(row.get("match_count", 0) or 0)
+                    )
 
-                    page_total += 1
+                    is_ok = accuracy_val in ["100", "100.0"]
+
+                    page_total += row_item_count
+                    page_passed += row_match_count
 
                     page_items.append({
                         "no": idx,
@@ -171,26 +332,33 @@ def button_click():
                         "recognized": recognized_disp,
                         "is_ok": is_ok
                     })
-        except Exception as err:
-            print(f"❌ CSV読み込みエラー ({file}): {err}")
 
-        page_acc = (page_passed / page_total * 100) if page_total > 0 else 0
+        except Exception as err:
+            print(f"❌ OCR詳細CSV読み込みエラー ({file}): {err}")
+
+        page_acc = (
+            page_passed / page_total * 100
+            if page_total > 0
+            else 0
+        )
+
+        page_data["page_total"] = page_total
+        page_data["page_passed"] = page_passed
+        page_data["page_acc"] = page_acc
+        page_data["items"] = page_items
+
+        # ここにはdetailだけが入る
         total_cumulative_items += page_total
         passed_cumulative_items += page_passed
-
-        if pdf_base_name not in pdf_groups:
-            pdf_groups[pdf_base_name] = []
-
-        pdf_groups[pdf_base_name].append({
-            "page_num": page_num,
-            "sheet_title": sheet_title,
-            "page_total": page_total,
-            "page_passed": page_passed,
-            "page_acc": page_acc,
-            "items": page_items
-        })
+        
 
     total_acc = (passed_cumulative_items / total_cumulative_items * 100) if total_cumulative_items > 0 else 0
+    
+    classification_acc = (
+        classification_passed / classification_total * 100
+        if classification_total > 0
+        else 0
+    )
 
     pdf_cards_html = ""
     excel_export_path = project_root / "results" / "全ページ詳細明細_Excel用.csv"
@@ -206,22 +374,54 @@ def button_click():
             pdf_passed = sum(p["page_passed"] for p in pages)
             pdf_acc = (pdf_passed / pdf_total * 100) if pdf_total > 0 else 0
             
+            pdf_classification_total = sum(
+                p["classification_total"] for p in pages
+            )
+
+            pdf_classification_passed = sum(
+                p["classification_passed"] for p in pages
+            )
+
+            pdf_classification_acc = (
+                pdf_classification_passed / pdf_classification_total * 100
+                if pdf_classification_total > 0
+                else 0
+            )
+            
             pdf_acc_class = "result-ok" if pdf_acc >= 90 else "result-ng"
+            
+            pdf_classification_class = (
+                "result-ok"
+                if pdf_classification_passed == pdf_classification_total
+                and pdf_classification_total > 0
+                else "result-ng"
+            )
 
             pages_summary_rows = ""
             pages_detail_blocks = ""
 
             for p in pages:
                 p_acc_class = "result-ok" if p["page_acc"] >= 90 else "result-ng"
+                
+                p_classification_ok = (
+                p["classification_total"] > 0
+                and p["classification_passed"] == p["classification_total"]
+            )
+
+                p_classification_class = "result-ok" if p_classification_ok else "result-ng"
+                p_classification_mark = "〇" if p_classification_ok else "✖"
             
                 pages_summary_rows += f"""
                 <tr>
                     <td style="text-align:center;">ページ {p['page_num']}</td>
                     <td style="font-weight:bold; color:#ff7bd5;">{p['sheet_title']}</td>
+                    <td class="{p_classification_class}" style="text-align:center;">
+                        {p_classification_mark}
+                    </td>
                     <td style="text-align:center;">{p['page_passed']} / {p['page_total']} 項目</td>
                     <td class="{p_acc_class}" style="text-align:center;">{p['page_acc']:.1f}%</td>
                 </tr>
-                """
+                    """
 
                 item_rows_html = ""
                 for item in p["items"]:
@@ -275,10 +475,22 @@ def button_click():
                         <span class="pdf-title">📁 PDF {pdf_idx} : {pdf_name}</span>
                         <span class="pdf-sub">({len(pages)} ページ構成)</span>
                     </div>
-                    <div class="pdf-score">
-                        正解率: <span class="{pdf_acc_class}">{pdf_acc:.1f}%</span> ({pdf_passed}/{pdf_total})
-                        <span class="arrow-icon">▼ クリックで詳細</span>
-                    </div>
+                <div class="pdf-score">
+                    分類:
+                    <span class="{pdf_classification_class}">
+                        {pdf_classification_acc:.1f}%
+                    </span>
+                    ({pdf_classification_passed}/{pdf_classification_total})
+
+                    ／ OCR:
+                    <span class="{pdf_acc_class}">
+                        {pdf_acc:.1f}%
+                    </span>
+                    ({pdf_passed}/{pdf_total})
+
+                    <span class="arrow-icon">▼ クリックで詳細</span>
+                </div>
+
                 </div>
                 
                 <div id="pdf_detail_{pdf_idx}" class="pdf-body" style="display: block;">
@@ -289,6 +501,7 @@ def button_click():
                                 <tr>
                                     <th style="text-align:center;">ページ</th>
                                     <th>帳票タイトル</th>
+                                    <th style="text-align:center;">分類</th>
                                     <th style="text-align:center;">正解数 / 項目数</th>
                                     <th style="text-align:center;">正解率</th>
                                 </tr>
@@ -487,17 +700,29 @@ def button_click():
             <div class="stat-value">{len(pdf_groups)}</div>
             <div class="stat-label">Total PDFs (ファイル数)</div>
         </div>
+
         <div class="stat">
-            <div class="stat-value">{total_cumulative_items}</div>
-            <div class="stat-label">Total Items (総項目数)</div>
+            <div class="stat-value">
+                {classification_passed} / {classification_total}
+            </div>
+            <div class="stat-label">Classification (分類正解 / ページ数)</div>
         </div>
+
         <div class="stat">
-            <div class="stat-value">{passed_cumulative_items}</div>
-            <div class="stat-label">Passed Items (正解数)</div>
+            <div class="stat-value pink">{classification_acc:.1f}%</div>
+            <div class="stat-label">Classification Accuracy (分類精度)</div>
         </div>
+
+        <div class="stat">
+            <div class="stat-value">
+                {passed_cumulative_items} / {total_cumulative_items}
+            </div>
+            <div class="stat-label">OCR Items (OCR正解 / 総項目数)</div>
+        </div>
+
         <div class="stat">
             <div class="stat-value pink">{total_acc:.1f}%</div>
-            <div class="stat-label">Cumulative Accuracy (正解率)</div>
+            <div class="stat-label">OCR Accuracy (OCR精度)</div>
         </div>
     </div>
 

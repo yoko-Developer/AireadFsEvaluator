@@ -152,18 +152,61 @@ class Csv4dbEvaluator:
                     total_matches = 0
                     page_df_list = []
 
-                    bs_acc = "-"
-                    pl_acc = "-"
-                    sg_acc = "-"
-                    ss_acc = "-"
-                    seizo_acc = "-"
+                    classification_total = 0
+                    classification_matches = 0
+                    
+                    # ページごとの帳票タイトルを分類CSVから取得
+                    page_title_map = {}
+
+                    for page_file_name, df in page_list:
+                        if "_detail" not in page_file_name:
+                            page_key = page_file_name.replace(".csv", "")
+
+                            for _, row in df.iterrows():
+                                gt_formid = str(row.get("c1_gt", "")).strip()
+
+                                if gt_formid and gt_formid != "formid":
+                                    title = self.FORM_ID_MAP.get(gt_formid)
+                                    if title:
+                                        page_title_map[page_key] = title
+                                    break
+                    
+                    form_totals = {
+                        "貸借対照表 (BS)": [0, 0],
+                        "損益計算書 (PL)": [0, 0],
+                        "製造原価報告書": [0, 0],
+                        "販売費及び一般管理費明細書": [0, 0],
+                        "株主資本等変動計算書": [0, 0],
+                    }
 
                     # ★直前の検出タイトルを記憶する変数★
                     last_detected_title = None
 
                     for page_file_name, df in page_list:
+                        
+                        # 分類データ（_detail ではない通常CSV）
+                        if "_detail" not in page_file_name:
+                            gt_formid = ""
+                            pd_formid = ""
+
+                            for _, row in df.iterrows():
+                                gt = str(row.get("c1_gt", "")).strip()
+                                pd = str(row.get("c1_pd", "")).strip()
+
+                                if gt and gt != "formid":
+                                    gt_formid = gt
+                                    pd_formid = pd
+                                    break
+
+                            if gt_formid:
+                                classification_total += 1
+                                if gt_formid == pd_formid:
+                                    classification_matches += 1
+
+                            continue                        
+                        
                         # 明細データ(_detail)または比較DataFrame
-                        if "_detail" in page_file_name or "c0_gt" in df.columns:
+                        if "_detail" in page_file_name:
                             total_pages += 1
                             item_sum = df['item_count'].sum() if 'item_count' in df.columns else len(df)
                             match_sum = df['match_count'].sum() if 'match_count' in df.columns else 0
@@ -173,25 +216,33 @@ class Csv4dbEvaluator:
 
                             p_acc_num = round((match_sum / item_sum * 100), 1) if item_sum > 0 else 100.0
 
-                            # ★formidを検知。無ければ「直前のタイトル」をそのまま継承！★
-                            detected_title = self._detect_title_by_formid(df)
-                            if detected_title:
-                                last_detected_title = detected_title
-                            else:
-                                detected_title = last_detected_title if last_detected_title else f"決算書 ({page_file_name})"
+                            # 同じページの分類CSVから帳票タイトルを取得
+                            page_key = page_file_name.replace("_detail.csv", "")
 
-                            if detected_title == "貸借対照表 (BS)":
-                                bs_acc = p_acc_num
-                            elif detected_title == "損益計算書 (PL)":
-                                pl_acc = p_acc_num
-                            elif detected_title == "製造原価報告書":
-                                seizo_acc = p_acc_num
-                            elif detected_title == "販売費及び一般管理費明細書":
-                                sg_acc = p_acc_num
-                            elif detected_title == "株主資本等変動計算書":
-                                ss_acc = p_acc_num
+                            detected_title = page_title_map.get(page_key)
+
+                            # 念のためdetail内のformidも確認
+                            if not detected_title:
+                                detected_title = self._detect_title_by_formid(df)
+
+                            if not detected_title:
+                                detected_title = f"決算書 ({page_file_name})"
+
+                        if detected_title in form_totals:
+                            form_totals[detected_title][0] += match_sum
+                            form_totals[detected_title][1] += item_sum
 
                             page_df_list.append((detected_title, df))
+                            
+                    def form_acc(title):
+                        matches, items = form_totals[title]
+                        return round(matches / items * 100, 1) if items > 0 else "-"
+
+                    bs_acc = form_acc("貸借対照表 (BS)")
+                    pl_acc = form_acc("損益計算書 (PL)")
+                    seizo_acc = form_acc("製造原価報告書")
+                    sg_acc = form_acc("販売費及び一般管理費明細書")
+                    ss_acc = form_acc("株主資本等変動計算書")                            
 
                     acc = round((total_matches / total_items * 100), 2) if total_items > 0 else 0.0
 
@@ -201,6 +252,8 @@ class Csv4dbEvaluator:
                         "total_items": total_items,
                         "total_matches": total_matches,
                         "accuracy": acc,
+                        "classification_total": classification_total,
+                        "classification_matches": classification_matches,
                         "BS_acc": bs_acc,
                         "PL_acc": pl_acc,
                         "販管費_acc": sg_acc,
@@ -391,52 +444,180 @@ class Csv4dbEvaluator:
     # ==========================================
     # 行の紐付け (Row Alignment)
     # ==========================================
-    def _align_rows_by_fuzzy_match(self, gt_df: pandas.DataFrame, pd_df: pandas.DataFrame) -> Tuple[pandas.DataFrame, pandas.DataFrame]:
-        gt_norm = gt_df.apply(lambda r: self._normalize_text(''.join(r.dropna().astype(str))), axis=1).tolist()
-        pd_norm = pd_df.apply(lambda r: self._normalize_text(''.join(r.dropna().astype(str))), axis=1).tolist()
+    def _align_rows_by_fuzzy_match(
+        self,
+        gt_df: pandas.DataFrame,
+        pd_df: pandas.DataFrame
+    ) -> Tuple[pandas.DataFrame, pandas.DataFrame]:
+        """
+        GTとPredictionの行順を保ちながら対応付ける。
+        科目列(c0)を主に使い、途中の欠損行・余分な行を許容する。
+        """
 
-        matched_pairs = []
-        used_pd_row_idx = set()
-        for gt_row_idx, gt_text in enumerate(gt_norm):
-            if not gt_text:
-                matched_pairs.append((gt_row_idx, None))
-                continue
+        gt_rows = gt_df.reset_index(drop=True)
+        pd_rows = pd_df.reset_index(drop=True)
 
-            best_idx, best_sim = None, -1.0
-            for pd_row_idx, pd_text in enumerate(pd_norm):
-                if pd_row_idx in used_pd_row_idx or not pd_text:
-                    continue
-                
-                sim = self._get_similarity(gt_text, pd_text)
-                if sim > best_sim and sim > 0.35:
-                    best_sim, best_idx = sim, pd_row_idx
+        gt_count = len(gt_rows)
+        pd_count = len(pd_rows)
 
-            if best_idx is not None:
-                matched_pairs.append((gt_row_idx, best_idx))
-                used_pd_row_idx.add(best_idx)
+        def row_similarity(gt_row, pd_row) -> float:
+            # 科目列を最優先
+            gt_label = self._normalize_text(
+                str(gt_row.get("c0_gt", ""))
+            )
+            pd_label = self._normalize_text(
+                str(pd_row.get("c0_pd", ""))
+            )
+
+            # 行全体も補助的に見る
+            gt_full = self._normalize_text(
+                ''.join(gt_row.astype(str).tolist())
+            )
+            pd_full = self._normalize_text(
+                ''.join(pd_row.astype(str).tolist())
+            )
+
+            label_sim = self._get_similarity(gt_label, pd_label)
+            full_sim = self._get_similarity(gt_full, pd_full)
+
+            # 科目が両方ある場合は科目を主役にする
+            if gt_label and pd_label:
+                return (label_sim * 0.8) + (full_sim * 0.2)
+
+            # 科目が空欄の行は行全体で判断
+            return full_sim
+
+        # ------------------------------------------
+        # 動的計画法で「順番を壊さない」最適な対応を探す
+        # ------------------------------------------
+        gap_penalty = -0.25
+
+        dp = [
+            [0.0 for _ in range(pd_count + 1)]
+            for _ in range(gt_count + 1)
+        ]
+
+        trace = [
+            [None for _ in range(pd_count + 1)]
+            for _ in range(gt_count + 1)
+        ]
+
+        for i in range(1, gt_count + 1):
+            dp[i][0] = dp[i - 1][0] + gap_penalty
+            trace[i][0] = "gt_only"
+
+        for j in range(1, pd_count + 1):
+            dp[0][j] = dp[0][j - 1] + gap_penalty
+            trace[0][j] = "pd_only"
+
+        for i in range(1, gt_count + 1):
+            for j in range(1, pd_count + 1):
+
+                sim = row_similarity(
+                    gt_rows.iloc[i - 1],
+                    pd_rows.iloc[j - 1]
+                )
+
+                # 類似度0.5を基準に、
+                # 似ている行はプラス、似ていない行はマイナス
+                match_score = dp[i - 1][j - 1] + (sim - 0.5)
+
+                gt_only_score = (
+                    dp[i - 1][j] + gap_penalty
+                )
+
+                pd_only_score = (
+                    dp[i][j - 1] + gap_penalty
+                )
+
+                best_score = max(
+                    match_score,
+                    gt_only_score,
+                    pd_only_score
+                )
+
+                dp[i][j] = best_score
+
+                if best_score == match_score:
+                    trace[i][j] = "match"
+                elif best_score == gt_only_score:
+                    trace[i][j] = "gt_only"
+                else:
+                    trace[i][j] = "pd_only"
+
+        # ------------------------------------------
+        # 後ろからたどって対応関係を復元
+        # ------------------------------------------
+        aligned = []
+
+        i = gt_count
+        j = pd_count
+
+        while i > 0 or j > 0:
+
+            action = trace[i][j]
+
+            if action == "match":
+                aligned.append((i - 1, j - 1))
+                i -= 1
+                j -= 1
+
+            elif action == "gt_only":
+                aligned.append((i - 1, None))
+                i -= 1
+
+            elif action == "pd_only":
+                aligned.append((None, j - 1))
+                j -= 1
+
             else:
-                matched_pairs.append((gt_row_idx, None))
+                break
 
-        gt_df.insert(0, 'row_id', [f"r{i}" for i in range(len(gt_df))])
-        pd_df.insert(0, 'row_id', "")
+        aligned.reverse()
 
-        unmatched_pd_row_indices = sorted(set(range(len(pd_df))) - used_pd_row_idx)
+        # ------------------------------------------
+        # row_idを付ける
+        # ------------------------------------------
+        gt_df = gt_rows.copy()
+        pd_df = pd_rows.copy()
 
-        for gt_row_idx, pd_row_idx in matched_pairs:
-            if pd_row_idx is not None:
-                suffix: int = 0
-                while unmatched_pd_row_indices and unmatched_pd_row_indices[0] < pd_row_idx:
-                    extra_row_idx = unmatched_pd_row_indices.pop(0)
-                    pd_df.loc[extra_row_idx, 'row_id'] = f"extra_r{gt_row_idx}" if suffix == 0 else f"extra_r{gt_row_idx}_{suffix}"
-                    suffix += 1
+        gt_df.insert(0, "row_id", "")
+        pd_df.insert(0, "row_id", "")
 
-                pd_df.loc[pd_row_idx, 'row_id'] = f"r{gt_row_idx}"
+        gt_number = 0
+        extra_number = 0
 
-        for extra_row_idx in unmatched_pd_row_indices:
-            pd_df.loc[extra_row_idx, 'row_id'] = f"extra_r{extra_row_idx}"
+        for gt_idx, pd_idx in aligned:
+
+            if gt_idx is not None:
+                row_id = f"r{gt_number}"
+                gt_df.loc[gt_idx, "row_id"] = row_id
+
+                if pd_idx is not None:
+                    pd_df.loc[pd_idx, "row_id"] = row_id
+
+                gt_number += 1
+
+            elif pd_idx is not None:
+                pd_df.loc[pd_idx, "row_id"] = (
+                    f"extra_r{extra_number}"
+                )
+                extra_number += 1
+
+        # 念のためrow_idが付かなかった行にもIDを付ける
+        for idx in gt_df.index:
+            if not gt_df.loc[idx, "row_id"]:
+                gt_df.loc[idx, "row_id"] = f"r{gt_number}"
+                gt_number += 1
+
+        for idx in pd_df.index:
+            if not pd_df.loc[idx, "row_id"]:
+                pd_df.loc[idx, "row_id"] = (
+                    f"extra_r{extra_number}"
+                )
+                extra_number += 1
 
         return gt_df, pd_df
-
 
     # ==========================================
     # 個別レポート生成 (individual Report)
@@ -678,6 +859,10 @@ class Csv4dbEvaluator:
     @staticmethod
     def _calc_data_accuracy_by_row(row: pandas.Series) -> pandas.Series:
         """行単位の正解データ数/推論データと正解データとの一致数/精度を計算"""
+        
+        # CSVのヘッダー行はOCRの採点対象外
+        if str(row.get("row_id", "")).strip() == "r0":
+            return pandas.Series([0, 0, 100.0])
         gt_cols = [col for col in row.index if col.endswith('_gt')]
 
         item_count = 0
@@ -685,21 +870,25 @@ class Csv4dbEvaluator:
 
         for gt_col in gt_cols:
             gt_val = str(row[gt_col]) if pandas.notna(row[gt_col]) else ""
-            if gt_val == "":
-                continue
-
-            item_count += 1
 
             pd_col = gt_col.replace('_gt', '_pd')
+            pd_val = ""
             if pd_col in row.index:
                 pd_val = str(row[pd_col]) if pandas.notna(row[pd_col]) else ""
-                
-                gt_norm = Csv4dbEvaluator._normalize_text(gt_val)
-                pd_norm = Csv4dbEvaluator._normalize_text(pd_val)
-                
-                if gt_norm == pd_norm:
-                    match_count += 1
 
+            # GTもPredictionも空なら評価対象外
+            if gt_val == "" and pd_val == "":
+                continue
+
+            # どちらか一方に値があれば評価対象
+            item_count += 1
+
+            gt_norm = Csv4dbEvaluator._normalize_text(gt_val)
+            pd_norm = Csv4dbEvaluator._normalize_text(pd_val)
+
+            if gt_norm == pd_norm:
+                match_count += 1
+        
         accuracy = (match_count / item_count) * 100 if item_count > 0 else 0
         accuracy = round(accuracy, 2)
 
