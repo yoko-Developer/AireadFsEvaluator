@@ -129,7 +129,16 @@ class KessanExcelExporter:
         }
 
         row_idx = 3
-        for idx, data in enumerate(summary_data, start=1):
+        for idx, data in enumerate(
+            sorted(
+                summary_data,
+                key=lambda data: int(re.search(r'株式会社(\d+)', data.get("filename", "")).group(1))
+                if re.search(r'株式会社(\d+)', data.get("filename", ""))
+                else 999999999
+            ),
+            start=1
+        ):
+
             ws_matrix.cell(row=row_idx, column=1, value=idx).alignment = Alignment(horizontal="center", vertical="center")
             ws_matrix.cell(row=row_idx, column=2, value=data.get("filename", "")).alignment = Alignment(horizontal="left", vertical="center")
             
@@ -301,8 +310,20 @@ class KessanExcelExporter:
         # -------------------------------------------------------------
         # シート2以降: 📄 詳細シート
         # -------------------------------------------------------------
-        for sheet_name, page_df_list in detail_dfs:
-            safe_title = re.sub(r'[\\/*?:\[\]]', '', sheet_name)[:28]
+        def company_number(item):
+            sheet_name = item[0]
+            match = re.search(r'株式会社(\d+)', sheet_name)
+            return int(match.group(1)) if match else 999999999
+
+        for sheet_name, page_df_list in sorted(detail_dfs, key=company_number):
+
+            # ファイル名の「株式会社○○○」から会社番号を取得してシート名にする
+            company_match = re.search(r'株式会社(\d+)', sheet_name)
+            if company_match:
+                safe_title = company_match.group(1)
+            else:
+                safe_title = re.sub(r'[\\/*?:\[\]]', '', sheet_name)[:28]
+
             ws_detail = wb.create_sheet(title=safe_title)
             ws_detail.views.sheetView[0].showGridLines = False
 
@@ -313,15 +334,31 @@ class KessanExcelExporter:
 
             total_cols_count = 1 + (max_c_count * 3) + 1
 
-            ws_detail.row_dimensions[1].height = 22
-            ws_detail.row_dimensions[2].height = 22
+            ws_detail.row_dimensions[1].height = 24
+            ws_detail.row_dimensions[3].height = 22
+            ws_detail.row_dimensions[4].height = 22
 
-            ws_detail.merge_cells("A1:A2")
-            ws_detail.cell(row=1, column=1, value="No")
+            # 対象PDFファイル名
+            ws_detail.merge_cells(
+                start_row=1,
+                start_column=1,
+                end_row=1,
+                end_column=total_cols_count
+            )
+            file_cell = ws_detail.cell(
+                row=1,
+                column=1,
+                value=f"対象PDF：{sheet_name}.pdf"
+            )
+            file_cell.font = cls.TITLE_FONT
+            file_cell.alignment = Alignment(horizontal="left", vertical="center")
+
+            ws_detail.merge_cells("A3:A4")
+            ws_detail.cell(row=3, column=1, value="No")
 
             last_col_letter = get_column_letter(total_cols_count)
-            ws_detail.merge_cells(f"{last_col_letter}1:{last_col_letter}2")
-            ws_detail.cell(row=1, column=total_cols_count, value="行正解率")
+            ws_detail.merge_cells(f"{last_col_letter}3:{last_col_letter}4")
+            ws_detail.cell(row=3, column=total_cols_count, value="行正解率")
 
             for c_i in range(max_c_count):
                 start_c = 2 + (c_i * 3)
@@ -330,14 +367,14 @@ class KessanExcelExporter:
                 end_let = get_column_letter(end_c)
 
                 grp_title = "科目" if c_i == 0 else f"金額{c_i}" if max_c_count > 2 else "金額"
-                ws_detail.merge_cells(f"{start_let}1:{end_let}1")
-                ws_detail.cell(row=1, column=start_c, value=grp_title)
+                ws_detail.merge_cells(f"{start_let}3:{end_let}3")
+                ws_detail.cell(row=3, column=start_c, value=grp_title)
 
-                ws_detail.cell(row=2, column=start_c, value="マスタ")
-                ws_detail.cell(row=2, column=start_c + 1, value="読み取り")
-                ws_detail.cell(row=2, column=start_c + 2, value="判定")
+                ws_detail.cell(row=4, column=start_c, value="マスタ")
+                ws_detail.cell(row=4, column=start_c + 1, value="読み取り")
+                ws_detail.cell(row=4, column=start_c + 2, value="判定")
 
-            for r in [1, 2]:
+            for r in [3, 4]:
                 for c in range(1, total_cols_count + 1):
                     cell = ws_detail.cell(row=r, column=c)
                     cell.fill = cls.PASTEL_PINK_FILL
@@ -345,7 +382,7 @@ class KessanExcelExporter:
                     cell.alignment = Alignment(horizontal="center", vertical="center")
                     cell.border = cls.THIN_BORDER
 
-            current_row = 3
+            current_row = 5
 
             for raw_p_title, df_page in page_df_list:
                 # ★formidから正解の帳票タイトルを動的に決定★
