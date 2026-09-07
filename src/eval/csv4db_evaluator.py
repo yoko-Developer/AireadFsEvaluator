@@ -76,7 +76,7 @@ class Csv4dbEvaluator:
         # prediction files（比較対象ファイル）
         pd_files = [f for f in sorted(self.predictions_dir.iterdir()) if f.is_file() and f.suffix == '.csv']
         num_of_file = len(pd_files)
-
+        
         # 統計集計用に (ファイル名, 統合データフレーム) のリストを保持
         evaluation_results: List[Tuple[str, pandas.DataFrame]] = []
 
@@ -151,12 +151,14 @@ class Csv4dbEvaluator:
                     total_items = 0
                     total_matches = 0
                     page_df_list = []
+                    detail_page_keys = set()
 
                     classification_total = 0
                     classification_matches = 0
                     
                     # ページごとの帳票タイトルを分類CSVから取得
                     page_title_map = {}
+                    classification_ok_map = {}
 
                     for page_file_name, df in page_list:
                         if "_detail" not in page_file_name:
@@ -164,11 +166,17 @@ class Csv4dbEvaluator:
 
                             for _, row in df.iterrows():
                                 gt_formid = str(row.get("c1_gt", "")).strip()
+                                pd_formid = str(row.get("c1_pd", "")).strip()
 
                                 if gt_formid and gt_formid != "formid":
                                     title = self.FORM_ID_MAP.get(gt_formid)
+
                                     if title:
                                         page_title_map[page_key] = title
+
+                                    classification_ok_map[page_key] = (
+                                        gt_formid == pd_formid
+                                    )
                                     break
                     
                     form_totals = {
@@ -183,7 +191,7 @@ class Csv4dbEvaluator:
                     last_detected_title = None
 
                     for page_file_name, df in page_list:
-                        
+
                         # 分類データ（_detail ではない通常CSV）
                         if "_detail" not in page_file_name:
                             gt_formid = ""
@@ -199,40 +207,63 @@ class Csv4dbEvaluator:
                                     break
 
                             if gt_formid:
+                                total_pages += 1
                                 classification_total += 1
                                 if gt_formid == pd_formid:
                                     classification_matches += 1
 
-                            continue                        
-                        
-                        # 明細データ(_detail)または比較DataFrame
-                        if "_detail" in page_file_name:
-                            total_pages += 1
-                            item_sum = df['item_count'].sum() if 'item_count' in df.columns else len(df)
-                            match_sum = df['match_count'].sum() if 'match_count' in df.columns else 0
+                            continue
 
+                        # 明細データ(_detail)
+                        page_key = page_file_name.replace("_detail.csv", "")
+                        detail_page_keys.add(page_key)
+
+                        item_sum = (
+                            df["item_count"].sum()
+                            if "item_count" in df.columns
+                            else len(df)
+                        )
+                        match_sum = (
+                            df["match_count"].sum()
+                            if "match_count" in df.columns
+                            else 0
+                        )
+
+                        # 分類〇のページだけOCR集計に入れる
+                        is_classification_ok = classification_ok_map.get(page_key, True)
+
+                        if is_classification_ok:
                             total_items += item_sum
                             total_matches += match_sum
+                        else:
+                            # Excel表示用に「分類不一致」を記録
+                            df.attrs["classification_mismatch"] = True
 
-                            p_acc_num = round((match_sum / item_sum * 100), 1) if item_sum > 0 else 100.0
+                        # GTの分類CSVから帳票タイトルを取得
+                        detected_title = page_title_map.get(page_key)
 
-                            # 同じページの分類CSVから帳票タイトルを取得
-                            page_key = page_file_name.replace("_detail.csv", "")
+                        # 念のためdetail内のformidも確認
+                        if not detected_title:
+                            detected_title = self._detect_title_by_formid(df)
 
-                            detected_title = page_title_map.get(page_key)
-
-                            # 念のためdetail内のformidも確認
-                            if not detected_title:
-                                detected_title = self._detect_title_by_formid(df)
-
-                            if not detected_title:
-                                detected_title = f"決算書 ({page_file_name})"
+                        if not detected_title:
+                            detected_title = f"決算書 ({page_file_name})"
 
                         if detected_title in form_totals:
-                            form_totals[detected_title][0] += match_sum
-                            form_totals[detected_title][1] += item_sum
+                            # 帳票別OCR精度も分類〇だけ集計
+                            if is_classification_ok:
+                                form_totals[detected_title][0] += match_sum
+                                form_totals[detected_title][1] += item_sum
 
+                            # 分類×でもExcel上からページ自体は消さない
                             page_df_list.append((detected_title, df))
+
+                    # 分類CSVは存在するがdetail CSVが存在しないページをExcel表示用に残す
+                    for page_key, page_title in page_title_map.items():
+                        if page_key not in detail_page_keys:
+                            missing_df = pandas.DataFrame()
+                            missing_df.attrs["missing_detail"] = True
+                            page_df_list.append((page_title, missing_df))                            
                             
                     def form_acc(title):
                         matches, items = form_totals[title]

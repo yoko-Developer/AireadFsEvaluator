@@ -385,13 +385,103 @@ class KessanExcelExporter:
             current_row = 5
 
             for raw_p_title, df_page in page_df_list:
-                # ★formidから正解の帳票タイトルを動的に決定★
-                p_title = cls.get_title_from_df(df_page, raw_p_title)
+                # detail CSVが存在しないページかどうか
+                is_missing_detail = bool(df_page.attrs.get("missing_detail", False))
+                is_classification_mismatch = bool(df_page.attrs.get("classification_mismatch", False))
 
+                # 通常ページはformidからタイトル取得、detailなしページはGTのタイトルをそのまま使う
+                p_title = (
+                    raw_p_title
+                    if is_missing_detail or is_classification_mismatch
+                    else cls.get_title_from_df(df_page, raw_p_title)
+                )
+                
                 title_row_idx = current_row
-                ws_detail.merge_cells(start_row=title_row_idx, start_column=1, end_row=title_row_idx, end_column=total_cols_count)
+                ws_detail.merge_cells(
+                    start_row=title_row_idx,
+                    start_column=1,
+                    end_row=title_row_idx,
+                    end_column=total_cols_count
+                )
                 ws_detail.row_dimensions[title_row_idx].height = 22
                 current_row += 1
+                
+                # 分類が不一致のページは、OCR採点対象外として表示する
+                if is_classification_mismatch:
+                    ws_detail.merge_cells(
+                        start_row=current_row,
+                        start_column=1,
+                        end_row=current_row,
+                        end_column=total_cols_count
+                    )
+
+                    msg_cell = ws_detail.cell(
+                        row=current_row,
+                        column=1,
+                        value="OCR評価対象外（分類不一致）"
+                    )
+                    msg_cell.fill = cls.HEADER_ROW_FILL
+                    msg_cell.font = cls.HEADER_ROW_FONT
+                    msg_cell.alignment = Alignment(horizontal="center", vertical="center")
+
+                    title_text = f"📄 {p_title}   【OCR評価対象外（分類不一致）】"
+                    title_cell = ws_detail.cell(row=title_row_idx, column=1, value=title_text)
+                    title_cell.fill = cls.PAGE_TITLE_FILL
+                    title_cell.font = cls.PAGE_TITLE_FONT
+                    title_cell.alignment = Alignment(horizontal="left", vertical="center")
+
+                    current_row += 1
+                    continue                                
+
+                # detail CSVが無いページは、OCR採点せずExcelには存在だけ残す
+                if is_missing_detail:
+                    ws_detail.merge_cells(
+                        start_row=current_row,
+                        start_column=1,
+                        end_row=current_row,
+                        end_column=total_cols_count
+                    )
+
+                    msg_cell = ws_detail.cell(
+                        row=current_row,
+                        column=1,
+                        value="OCR評価対象外（明細CSVなし）"
+                    )
+                    msg_cell.fill = cls.HEADER_ROW_FILL
+                    msg_cell.font = cls.HEADER_ROW_FONT
+                    msg_cell.alignment = Alignment(
+                        horizontal="center",
+                        vertical="center"
+                    )
+
+                    for c_idx in range(1, total_cols_count + 1):
+                        ws_detail.cell(
+                            row=current_row,
+                            column=c_idx
+                        ).border = cls.THIN_BORDER
+
+                    title_text = f"📄 {p_title}   【OCR評価対象外（明細CSVなし）】"
+
+                    t_cell = ws_detail.cell(
+                        row=title_row_idx,
+                        column=1,
+                        value=title_text
+                    )
+                    t_cell.fill = cls.PAGE_TITLE_FILL
+                    t_cell.font = cls.PAGE_TITLE_FONT
+                    t_cell.alignment = Alignment(
+                        horizontal="left",
+                        vertical="center"
+                    )
+
+                    for c_idx in range(1, total_cols_count + 1):
+                        ws_detail.cell(
+                            row=title_row_idx,
+                            column=c_idx
+                        ).border = cls.THIN_BORDER
+
+                    current_row += 1
+                    continue
 
                 item_no = 1
                 col_item_counts = [0] * max_c_count
