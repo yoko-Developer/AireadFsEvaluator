@@ -388,11 +388,12 @@ class KessanExcelExporter:
                 # detail CSVが存在しないページかどうか
                 is_missing_detail = bool(df_page.attrs.get("missing_detail", False))
                 is_classification_mismatch = bool(df_page.attrs.get("classification_mismatch", False))
+                is_classification_excluded = bool(df_page.attrs.get("classification_excluded", False))
 
-                # 通常ページはformidからタイトル取得、detailなしページはGTのタイトルをそのまま使う
+                # 通常ページはformidからタイトル取得、評価対象外/採点対象外ページはGTタイトルを使う
                 p_title = (
                     raw_p_title
-                    if is_missing_detail or is_classification_mismatch
+                    if is_missing_detail or is_classification_mismatch or is_classification_excluded
                     else cls.get_title_from_df(df_page, raw_p_title)
                 )
                 
@@ -406,6 +407,42 @@ class KessanExcelExporter:
                 ws_detail.row_dimensions[title_row_idx].height = 22
                 current_row += 1
                 
+                # 「不明」は正しい対象外判定。分類/OCRのどちらにも入れず、存在だけ表示する。
+                if is_classification_excluded:
+                    ws_detail.merge_cells(
+                        start_row=current_row,
+                        start_column=1,
+                        end_row=current_row,
+                        end_column=total_cols_count
+                    )
+
+                    msg_cell = ws_detail.cell(
+                        row=current_row,
+                        column=1,
+                        value="分類：評価対象外（不明） ／ OCR：評価対象外"
+                    )
+                    msg_cell.fill = cls.HEADER_ROW_FILL
+                    msg_cell.font = cls.HEADER_ROW_FONT
+                    msg_cell.alignment = Alignment(horizontal="center", vertical="center")
+
+                    for c_idx in range(1, total_cols_count + 1):
+                        ws_detail.cell(row=current_row, column=c_idx).border = cls.THIN_BORDER
+
+                    title_text = (
+                        f"📄 {p_title}   "
+                        "【分類：評価対象外（不明）／OCR：評価対象外】"
+                    )
+                    title_cell = ws_detail.cell(row=title_row_idx, column=1, value=title_text)
+                    title_cell.fill = cls.PAGE_TITLE_FILL
+                    title_cell.font = cls.PAGE_TITLE_FONT
+                    title_cell.alignment = Alignment(horizontal="left", vertical="center")
+
+                    for c_idx in range(1, total_cols_count + 1):
+                        ws_detail.cell(row=title_row_idx, column=c_idx).border = cls.THIN_BORDER
+
+                    current_row += 1
+                    continue
+
                 # 分類が不一致のページは、OCR採点対象外として表示する
                 if is_classification_mismatch:
                     ws_detail.merge_cells(

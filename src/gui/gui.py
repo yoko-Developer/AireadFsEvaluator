@@ -204,6 +204,7 @@ def run_evaluation_process():
                 "classification_passed": 0,
                 "classification_gt": "",
                 "classification_pd": "",
+                "classification_excluded": False,
 
                 # OCR値評価
                 "page_total": 0,
@@ -241,19 +242,24 @@ def run_evaluation_process():
             except Exception as err:
                 print(f"❌ 分類CSV読み込みエラー ({file}): {err}")
 
+            classification_excluded = (gt_formid == "不明")
             classification_ok = (
-                gt_formid != ""
+                not classification_excluded
+                and gt_formid != ""
                 and gt_formid == pd_formid
             )
 
-            page_data["classification_total"] = 1
+            page_data["classification_excluded"] = classification_excluded
+            page_data["classification_total"] = 0 if classification_excluded else 1
             page_data["classification_passed"] = 1 if classification_ok else 0
             page_data["classification_gt"] = gt_formid
             page_data["classification_pd"] = pd_formid
 
-            classification_total += 1
-            if classification_ok:
-                classification_passed += 1
+            # 「不明」は物理ページとして表示するが、分類の分母・分子には入れない。
+            if not classification_excluded:
+                classification_total += 1
+                if classification_ok:
+                    classification_passed += 1
 
             # GTのformidから帳票名を決める
             form_id_map = {
@@ -262,6 +268,7 @@ def run_evaluation_process():
                 "01_030_02": "製造原価報告書",
                 "01_040_02": "販売費及び一般管理費明細書",
                 "01_050_02": "株主資本等変動計算書",
+                "不明": "決算報告書（表紙）",
             }
 
             page_data["sheet_title"] = form_id_map.get(
@@ -276,6 +283,15 @@ def run_evaluation_process():
         # OCR値評価（_detail.csv）
         # --------------------------------
         page_data["detail_present"] = True
+
+        # GTが「不明」のページは、detailの有無に関係なくOCR評価対象外。
+        if page_data.get("classification_excluded", False):
+            page_data["ocr_status"] = "classification_excluded"
+            page_data["page_total"] = 0
+            page_data["page_passed"] = 0
+            page_data["page_acc"] = 0
+            page_data["items"] = []
+            continue
 
         # 分類が不一致のページはOCR採点から完全に除外する。
         # detail CSVが存在していても0点として数えない。
@@ -384,7 +400,13 @@ def run_evaluation_process():
     # detail無しを優先し、detail有り＋分類×だけ「分類不一致」とする。
     for pages in pdf_groups.values():
         for p in pages:
-            if not p.get("detail_present", False):
+            if p.get("classification_excluded", False):
+                p["ocr_status"] = "classification_excluded"
+                p["page_total"] = 0
+                p["page_passed"] = 0
+                p["page_acc"] = 0
+                p["items"] = []
+            elif not p.get("detail_present", False):
                 p["ocr_status"] = "missing_detail"
                 p["page_total"] = 0
                 p["page_passed"] = 0
@@ -452,16 +474,36 @@ def run_evaluation_process():
             pages_detail_blocks = ""
 
             for p in pages:
+                p_classification_excluded = p.get("classification_excluded", False)
                 p_classification_ok = (
-                    p["classification_total"] > 0
+                    not p_classification_excluded
+                    and p["classification_total"] > 0
                     and p["classification_passed"] == p["classification_total"]
                 )
-                p_classification_class = "result-ok" if p_classification_ok else "result-ng"
-                p_classification_mark = "〇" if p_classification_ok else "✖"
+
+                if p_classification_excluded:
+                    p_classification_class = "result-na"
+                    p_classification_mark = "評価対象外（不明）"
+                else:
+                    p_classification_class = "result-ok" if p_classification_ok else "result-ng"
+                    p_classification_mark = "〇" if p_classification_ok else "✖"
 
                 ocr_status = p.get("ocr_status", "")
 
-                if ocr_status == "classification_mismatch":
+                if ocr_status == "classification_excluded":
+                    ocr_summary_text = "OCR評価対象外"
+                    ocr_summary_class = "result-na"
+                    detail_content = f"""
+                    <div class="page-detail-box">
+                        <div class="page-detail-header">
+                            <span>📄 ページ {p['page_num']}：{p['sheet_title']}</span>
+                            <span class="result-na">分類：評価対象外（不明） ／ OCR：評価対象外</span>
+                        </div>
+                        <div class="not-evaluated">分類：評価対象外（不明） ／ OCR：評価対象外</div>
+                    </div>
+                    """
+
+                elif ocr_status == "classification_mismatch":
                     ocr_summary_text = "OCR評価対象外（分類不一致）"
                     ocr_summary_class = "result-na"
                     detail_content = f"""
