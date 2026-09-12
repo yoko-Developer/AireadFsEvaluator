@@ -205,6 +205,7 @@ def run_evaluation_process():
                 "classification_gt": "",
                 "classification_pd": "",
                 "classification_excluded": False,
+                "ocr_excluded": False,
 
                 # OCR値評価
                 "page_total": 0,
@@ -250,6 +251,7 @@ def run_evaluation_process():
             )
 
             page_data["classification_excluded"] = classification_excluded
+            page_data["ocr_excluded"] = (gt_formid in {"不明", "個別注記表"})
             page_data["classification_total"] = 0 if classification_excluded else 1
             page_data["classification_passed"] = 1 if classification_ok else 0
             page_data["classification_gt"] = gt_formid
@@ -269,6 +271,7 @@ def run_evaluation_process():
                 "01_040_02": "販売費及び一般管理費明細書",
                 "01_050_02": "株主資本等変動計算書",
                 "不明": "決算報告書（表紙）",
+                "個別注記表": "個別注記表",
             }
 
             page_data["sheet_title"] = form_id_map.get(
@@ -284,8 +287,8 @@ def run_evaluation_process():
         # --------------------------------
         page_data["detail_present"] = True
 
-        # GTが「不明」のページは、detailの有無に関係なくOCR評価対象外。
-        if page_data.get("classification_excluded", False):
+        # 表紙や「分類のみ評価」の帳票は、detailの有無に関係なくOCR評価対象外。
+        if page_data.get("ocr_excluded", False):
             page_data["ocr_status"] = "classification_excluded"
             page_data["page_total"] = 0
             page_data["page_passed"] = 0
@@ -406,6 +409,12 @@ def run_evaluation_process():
                 p["page_passed"] = 0
                 p["page_acc"] = 0
                 p["items"] = []
+            elif p.get("ocr_excluded", False):
+                p["ocr_status"] = "ocr_excluded"
+                p["page_total"] = 0
+                p["page_passed"] = 0
+                p["page_acc"] = 0
+                p["items"] = []
             elif not p.get("detail_present", False):
                 p["ocr_status"] = "missing_detail"
                 p["page_total"] = 0
@@ -500,6 +509,19 @@ def run_evaluation_process():
                             <span class="result-na">分類：評価対象外（不明） ／ OCR：評価対象外</span>
                         </div>
                         <div class="not-evaluated">分類：評価対象外（不明） ／ OCR：評価対象外</div>
+                    </div>
+                    """
+
+                elif ocr_status == "ocr_excluded":
+                    ocr_summary_text = "OCR評価対象外（分類のみ評価）"
+                    ocr_summary_class = "result-na"
+                    detail_content = f"""
+                    <div class="page-detail-box">
+                        <div class="page-detail-header">
+                            <span>📄 ページ {p['page_num']}：{p['sheet_title']}</span>
+                            <span class="result-na">OCR評価対象外（分類のみ評価）</span>
+                        </div>
+                        <div class="not-evaluated">分類は評価対象 ／ OCRは評価対象外</div>
                     </div>
                     """
 

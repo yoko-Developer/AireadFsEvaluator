@@ -28,9 +28,11 @@ class Csv4dbEvaluator:
         "01_050_02": "株主資本等変動計算書",
         # 決算5表のデータ化対象外ページ。物理ページとしては残すが採点しない。
         "不明": "決算報告書（表紙）",
+        "個別注記表": "個別注記表",
     }
 
     EXCLUDED_FORM_ID = "不明"
+    OCR_EXCLUDED_FORM_IDS = {"不明", "個別注記表"}
 
     def __init__(self, session: str, prediction_dir: Path, ground_truth_dir: Path, results_base_dir: Path) -> None:
         self.session: str = session
@@ -124,22 +126,21 @@ class Csv4dbEvaluator:
             # 統計用に結果を保存
             evaluation_results.append((pd_file.name, merged_df))
 
-        # AIReadが「不明」としてデータ化しなかった対象外ページは、
-        # Prediction側に通常CSV自体が作られないことがある。
-        # GT側の「formid=不明」だけは物理ページとしてレポートに残す。
+        # Prediction側に通常CSV自体が作られなかったページも、
+        # GTに存在する物理ページとしてレポートに残す。
+        # これにより「分類対象だがAIReadが不明/未出力」のページも分類×として評価できる。
         for gt_file in sorted(self.ground_truth_dir.iterdir()):
             if (
                 not gt_file.is_file()
                 or gt_file.suffix != ".csv"
                 or "_detail" in gt_file.name
                 or gt_file.name in pd_file_names
-                or not self._is_excluded_classification_gt(gt_file)
             ):
                 continue
 
             logging.info(
-                f"📄 対象外ページをGTから補完: {gt_file.name} "
-                "(Prediction CSVなし / formid=不明)"
+                f"📄 Prediction未出力ページをGTから補完: {gt_file.name} "
+                "(Prediction CSVなし)"
             )
 
             # 列・行の形だけGTと揃えてから、Predictionの実データ部分を空にする。
@@ -212,6 +213,7 @@ class Csv4dbEvaluator:
                     page_title_map = {}
                     classification_ok_map = {}
                     classification_excluded_map = {}
+                    ocr_excluded_map = {}
 
                     for page_file_name, df in page_list:
                         if "_detail" not in page_file_name:
@@ -229,6 +231,7 @@ class Csv4dbEvaluator:
                                         page_title_map[page_key] = title
 
                                     classification_excluded_map[page_key] = is_excluded
+                                    ocr_excluded_map[page_key] = (gt_formid in self.OCR_EXCLUDED_FORM_IDS)
                                     classification_ok_map[page_key] = (
                                         False if is_excluded else gt_formid == pd_formid
                                     )
@@ -290,10 +293,13 @@ class Csv4dbEvaluator:
 
                         # 「不明（対象外）」は分類/OCRとも採点しない。
                         is_classification_excluded = classification_excluded_map.get(page_key, False)
+                        is_ocr_excluded = ocr_excluded_map.get(page_key, False)
                         is_classification_ok = classification_ok_map.get(page_key, True)
 
                         if is_classification_excluded:
                             df.attrs["classification_excluded"] = True
+                        elif is_ocr_excluded:
+                            df.attrs["ocr_excluded"] = True
                         elif is_classification_ok:
                             total_items += item_sum
                             total_matches += match_sum
@@ -332,6 +338,8 @@ class Csv4dbEvaluator:
 
                             if classification_excluded_map.get(page_key, False):
                                 missing_df.attrs["classification_excluded"] = True
+                            elif ocr_excluded_map.get(page_key, False):
+                                missing_df.attrs["ocr_excluded"] = True
                             else:
                                 missing_df.attrs["missing_detail"] = True
 

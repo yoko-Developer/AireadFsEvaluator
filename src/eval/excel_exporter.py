@@ -49,7 +49,8 @@ class KessanExcelExporter:
         "01_020_02": "損益計算書 (PL)",
         "01_030_02": "製造原価報告書",
         "01_040_02": "販売費及び一般管理費明細書",
-        "01_050_02": "株主資本等変動計算書"
+        "01_050_02": "株主資本等変動計算書",
+        "個別注記表": "個別注記表"
     }
 
     @classmethod
@@ -389,11 +390,12 @@ class KessanExcelExporter:
                 is_missing_detail = bool(df_page.attrs.get("missing_detail", False))
                 is_classification_mismatch = bool(df_page.attrs.get("classification_mismatch", False))
                 is_classification_excluded = bool(df_page.attrs.get("classification_excluded", False))
+                is_ocr_excluded = bool(df_page.attrs.get("ocr_excluded", False))
 
                 # 通常ページはformidからタイトル取得、評価対象外/採点対象外ページはGTタイトルを使う
                 p_title = (
                     raw_p_title
-                    if is_missing_detail or is_classification_mismatch or is_classification_excluded
+                    if is_missing_detail or is_classification_mismatch or is_classification_excluded or is_ocr_excluded
                     else cls.get_title_from_df(df_page, raw_p_title)
                 )
                 
@@ -471,6 +473,26 @@ class KessanExcelExporter:
                     continue                                
 
                 # detail CSVが無いページは、OCR採点せずExcelには存在だけ残す
+                if is_ocr_excluded:
+                    ws_detail.merge_cells(
+                        start_row=current_row, start_column=1,
+                        end_row=current_row, end_column=total_cols_count
+                    )
+                    msg_cell = ws_detail.cell(
+                        row=current_row, column=1,
+                        value="分類は評価対象 ／ OCR：評価対象外（分類のみ評価）"
+                    )
+                    msg_cell.fill = cls.HEADER_ROW_FILL
+                    msg_cell.font = cls.HEADER_ROW_FONT
+                    msg_cell.alignment = Alignment(horizontal="center", vertical="center")
+                    for c_idx in range(1, total_cols_count + 1):
+                        ws_detail.cell(row=current_row, column=c_idx).border = cls.THIN_BORDER
+                    ws_detail.cell(row=title_row_idx, column=1).value = (
+                        f"📄 {p_title}   【OCR：評価対象外（分類のみ評価）】"
+                    )
+                    current_row += 2
+                    continue
+
                 if is_missing_detail:
                     ws_detail.merge_cells(
                         start_row=current_row,
