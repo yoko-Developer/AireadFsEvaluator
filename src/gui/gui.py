@@ -147,7 +147,15 @@ def run_evaluation_process():
         if fn not in latest_files_map or mtime > latest_files_map[fn][1]:
             latest_files_map[fn] = (fp, mtime)
 
-    final_target_paths = [v[0] for v in latest_files_map.values()]
+    # 分類CSVを必ず先に処理し、その後detail CSVを処理する。
+    # これにより、detail採点時点でそのページの分類〇/×が確定している。
+    final_target_paths = sorted(
+        [v[0] for v in latest_files_map.values()],
+        key=lambda fp: (
+            "_detail" in os.path.basename(fp),
+            os.path.basename(fp)
+        )
+    )
 
     for target_csv in final_target_paths:
         file = os.path.basename(target_csv)
@@ -196,12 +204,16 @@ def run_evaluation_process():
                 "classification_passed": 0,
                 "classification_gt": "",
                 "classification_pd": "",
+                "classification_excluded": False,
+                "ocr_excluded": False,
 
                 # OCR値評価
                 "page_total": 0,
                 "page_passed": 0,
                 "page_acc": 0,
-                "items": []
+                "items": [],
+                "detail_present": False,
+                "ocr_status": ""
             }
 
             pdf_groups[pdf_base_name].append(page_data)
@@ -231,19 +243,25 @@ def run_evaluation_process():
             except Exception as err:
                 print(f"❌ 分類CSV読み込みエラー ({file}): {err}")
 
+            classification_excluded = (gt_formid == "不明")
             classification_ok = (
-                gt_formid != ""
+                not classification_excluded
+                and gt_formid != ""
                 and gt_formid == pd_formid
             )
 
-            page_data["classification_total"] = 1
+            page_data["classification_excluded"] = classification_excluded
+            page_data["ocr_excluded"] = (gt_formid in {"不明", "個別注記表"})
+            page_data["classification_total"] = 0 if classification_excluded else 1
             page_data["classification_passed"] = 1 if classification_ok else 0
             page_data["classification_gt"] = gt_formid
             page_data["classification_pd"] = pd_formid
 
-            classification_total += 1
-            if classification_ok:
-                classification_passed += 1
+            # 「不明」は物理ページとして表示するが、分類の分母・分子には入れない。
+            if not classification_excluded:
+                classification_total += 1
+                if classification_ok:
+                    classification_passed += 1
 
             # GTのformidから帳票名を決める
             form_id_map = {
@@ -252,6 +270,8 @@ def run_evaluation_process():
                 "01_030_02": "製造原価報告書",
                 "01_040_02": "販売費及び一般管理費明細書",
                 "01_050_02": "株主資本等変動計算書",
+                "不明": "決算報告書（表紙）",
+                "個別注記表": "個別注記表",
             }
 
             page_data["sheet_title"] = form_id_map.get(
@@ -265,6 +285,34 @@ def run_evaluation_process():
         # --------------------------------
         # OCR値評価（_detail.csv）
         # --------------------------------
+        page_data["detail_present"] = True
+
+        # 表紙や「分類のみ評価」の帳票は、detailの有無に関係なくOCR評価対象外。
+        if page_data.get("ocr_excluded", False):
+            page_data["ocr_status"] = "classification_excluded"
+            page_data["page_total"] = 0
+            page_data["page_passed"] = 0
+            page_data["page_acc"] = 0
+            page_data["items"] = []
+            continue
+
+        # 分類が不一致のページはOCR採点から完全に除外する。
+        # detail CSVが存在していても0点として数えない。
+        classification_ok = (
+            page_data["classification_total"] > 0
+            and page_data["classification_passed"]
+            == page_data["classification_total"]
+        )
+
+        if not classification_ok:
+            page_data["ocr_status"] = "classification_mismatch"
+            page_data["page_total"] = 0
+            page_data["page_passed"] = 0
+            page_data["page_acc"] = 0
+            page_data["items"] = []
+            continue
+
+        page_data["ocr_status"] = "evaluated"
         page_items = []
         page_total = 0
         page_passed = 0
@@ -347,10 +395,32 @@ def run_evaluation_process():
         page_data["page_acc"] = page_acc
         page_data["items"] = page_items
 
-        # ここにはdetailだけが入る
+        # 分類〇かつdetailが存在するページだけがOCR累計に入る
         total_cumulative_items += page_total
         passed_cumulative_items += page_passed
-        
+
+    # detail CSVが無い物理ページも、画面上から消さずに状態を残す。
+    # detail無しを優先し、detail有り＋分類×だけ「分類不一致」とする。
+    for pages in pdf_groups.values():
+        for p in pages:
+            if p.get("classification_excluded", False):
+                p["ocr_status"] = "classification_excluded"
+                p["page_total"] = 0
+                p["page_passed"] = 0
+                p["page_acc"] = 0
+                p["items"] = []
+            elif p.get("ocr_excluded", False):
+                p["ocr_status"] = "ocr_excluded"
+                p["page_total"] = 0
+                p["page_passed"] = 0
+                p["page_acc"] = 0
+                p["items"] = []
+            elif not p.get("detail_present", False):
+                p["ocr_status"] = "missing_detail"
+                p["page_total"] = 0
+                p["page_passed"] = 0
+                p["page_acc"] = 0
+                p["items"] = []
 
     total_acc = (passed_cumulative_items / total_cumulative_items * 100) if total_cumulative_items > 0 else 0
     
@@ -360,6 +430,18 @@ def run_evaluation_process():
         else 0
     )
 
+    # SummaryもExcelと同じく会社番号順（201, 202, 203, ...）に並べる
+    def company_number_sort_key(pdf_name):
+        match = re.search(r"株式会社(\d+)", pdf_name)
+        if match:
+            return (0, int(match.group(1)), pdf_name)
+        return (1, float("inf"), pdf_name)
+
+    sorted_pdf_groups = sorted(
+        pdf_groups.items(),
+        key=lambda item: company_number_sort_key(item[0])
+    )
+
     pdf_cards_html = ""
     excel_export_path = project_root / "results" / "全ページ詳細明細_Excel用.csv"
     
@@ -367,7 +449,7 @@ def run_evaluation_process():
         writer = csv.writer(ef)
         writer.writerow(["PDFファイル名", "ページ番号", "帳票タイトル", "No", "マスタデータ", "AIRead読み取り結果", "判定(1/0)"])
 
-        for pdf_idx, (pdf_name, pages) in enumerate(pdf_groups.items(), 1):
+        for pdf_idx, (pdf_name, pages) in enumerate(sorted_pdf_groups, 1):
             pages = sorted(pages, key=lambda x: x["page_num"])
             
             pdf_total = sum(p["page_total"] for p in pages)
@@ -401,16 +483,127 @@ def run_evaluation_process():
             pages_detail_blocks = ""
 
             for p in pages:
-                p_acc_class = "result-ok" if p["page_acc"] >= 90 else "result-ng"
-                
+                p_classification_excluded = p.get("classification_excluded", False)
                 p_classification_ok = (
-                p["classification_total"] > 0
-                and p["classification_passed"] == p["classification_total"]
-            )
+                    not p_classification_excluded
+                    and p["classification_total"] > 0
+                    and p["classification_passed"] == p["classification_total"]
+                )
 
-                p_classification_class = "result-ok" if p_classification_ok else "result-ng"
-                p_classification_mark = "〇" if p_classification_ok else "✖"
-            
+                if p_classification_excluded:
+                    p_classification_class = "result-na"
+                    p_classification_mark = "評価対象外（不明）"
+                else:
+                    p_classification_class = "result-ok" if p_classification_ok else "result-ng"
+                    p_classification_mark = "〇" if p_classification_ok else "✖"
+
+                ocr_status = p.get("ocr_status", "")
+
+                if ocr_status == "classification_excluded":
+                    ocr_summary_text = "OCR評価対象外"
+                    ocr_summary_class = "result-na"
+                    detail_content = f"""
+                    <div class="page-detail-box">
+                        <div class="page-detail-header">
+                            <span>📄 ページ {p['page_num']}：{p['sheet_title']}</span>
+                            <span class="result-na">分類：評価対象外（不明） ／ OCR：評価対象外</span>
+                        </div>
+                        <div class="not-evaluated">分類：評価対象外（不明） ／ OCR：評価対象外</div>
+                    </div>
+                    """
+
+                elif ocr_status == "ocr_excluded":
+                    ocr_summary_text = "OCR評価対象外（分類のみ評価）"
+                    ocr_summary_class = "result-na"
+                    detail_content = f"""
+                    <div class="page-detail-box">
+                        <div class="page-detail-header">
+                            <span>📄 ページ {p['page_num']}：{p['sheet_title']}</span>
+                            <span class="result-na">OCR評価対象外（分類のみ評価）</span>
+                        </div>
+                        <div class="not-evaluated">分類は評価対象 ／ OCRは評価対象外</div>
+                    </div>
+                    """
+
+                elif ocr_status == "classification_mismatch":
+                    ocr_summary_text = "OCR評価対象外（分類不一致）"
+                    ocr_summary_class = "result-na"
+                    detail_content = f"""
+                    <div class="page-detail-box">
+                        <div class="page-detail-header">
+                            <span>📄 ページ {p['page_num']}：{p['sheet_title']}</span>
+                            <span class="result-na">OCR評価対象外（分類不一致）</span>
+                        </div>
+                        <div class="not-evaluated">OCR評価対象外（分類不一致）</div>
+                    </div>
+                    """
+
+                elif ocr_status == "missing_detail":
+                    ocr_summary_text = "OCR評価対象外（明細CSVなし）"
+                    ocr_summary_class = "result-na"
+                    detail_content = f"""
+                    <div class="page-detail-box">
+                        <div class="page-detail-header">
+                            <span>📄 ページ {p['page_num']}：{p['sheet_title']}</span>
+                            <span class="result-na">OCR評価対象外（明細CSVなし）</span>
+                        </div>
+                        <div class="not-evaluated">OCR評価対象外（明細CSVなし）</div>
+                    </div>
+                    """
+
+                else:
+                    p_acc_class = "result-ok" if p["page_acc"] >= 90 else "result-ng"
+                    ocr_summary_text = (
+                        f"{p['page_passed']} / {p['page_total']} 項目 ／ "
+                        f"{p['page_acc']:.1f}%"
+                    )
+                    ocr_summary_class = p_acc_class
+
+                    item_rows_html = ""
+                    for item in p["items"]:
+                        r_class = "result-ok" if item["is_ok"] else "result-ng"
+                        r_mark = "〇" if item["is_ok"] else "✖"
+                        item_rows_html += f"""
+                        <tr>
+                            <td style="text-align:center;">{item['no']}</td>
+                            <td>{item['correct']}</td>
+                            <td>{item['recognized']}</td>
+                            <td class="{r_class}" style="text-align:center;">{r_mark}</td>
+                        </tr>
+                        """
+
+                        writer.writerow([
+                            pdf_name,
+                            f"ページ {p['page_num']}",
+                            p['sheet_title'],
+                            item['no'],
+                            item['correct'],
+                            item['recognized'],
+                            "1" if item['is_ok'] else "0"
+                        ])
+
+                    detail_content = f"""
+                    <div class="page-detail-box">
+                        <div class="page-detail-header">
+                            <span>📄 ページ {p['page_num']}：{p['sheet_title']}</span>
+                            <span class="{p_acc_class}">正解率: {p['page_acc']:.1f}% ({p['page_passed']}/{p['page_total']})</span>
+                        </div>
+                        <table class="detail-table">
+                            <thead>
+                                <tr>
+                                    <th style="width: 8%; text-align:center;">No</th>
+                                    <th style="width: 42%;">マスタデータ</th>
+                                    <th style="width: 42%;">AIRead 読み取り結果</th>
+                                    <th style="width: 8%; text-align:center;">判定</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {item_rows_html}
+                            </tbody>
+                        </table>
+                    </div>
+                    """
+
                 pages_summary_rows += f"""
                 <tr>
                     <td style="text-align:center;">ページ {p['page_num']}</td>
@@ -418,55 +611,13 @@ def run_evaluation_process():
                     <td class="{p_classification_class}" style="text-align:center;">
                         {p_classification_mark}
                     </td>
-                    <td style="text-align:center;">{p['page_passed']} / {p['page_total']} 項目</td>
-                    <td class="{p_acc_class}" style="text-align:center;">{p['page_acc']:.1f}%</td>
+                    <td class="{ocr_summary_class}" style="text-align:center;" colspan="2">
+                        {ocr_summary_text}
+                    </td>
                 </tr>
-                    """
-
-                item_rows_html = ""
-                for item in p["items"]:
-                    r_class = "result-ok" if item["is_ok"] else "result-ng"
-                    r_mark = "〇" if item["is_ok"] else "✖"
-                    item_rows_html += f"""
-                    <tr>
-                        <td style="text-align:center;">{item['no']}</td>
-                        <td>{item['correct']}</td>
-                        <td>{item['recognized']}</td>
-                        <td class="{r_class}" style="text-align:center;">{r_mark}</td>
-                    </tr>
-                    """
-                                    
-                    writer.writerow([
-                        pdf_name,
-                        f"ページ {p['page_num']}",
-                        p['sheet_title'],
-                        item['no'],
-                        item['correct'],
-                        item['recognized'],
-                        "1" if item['is_ok'] else "0"
-                    ])
-
-                pages_detail_blocks += f"""
-                <div class="page-detail-box">
-                    <div class="page-detail-header">
-                        <span>📄 ページ {p['page_num']}：{p['sheet_title']}</span>
-                        <span class="{p_acc_class}">正解率: {p['page_acc']:.1f}% ({p['page_passed']}/{p['page_total']})</span>
-                    </div>
-                    <table class="detail-table">
-                        <thead>
-                            <tr>
-                                <th style="width: 8%; text-align:center;">No</th>
-                                <th style="width: 42%;">マスタデータ</th>
-                                <th style="width: 42%;">AIRead 読み取り結果</th>
-                                <th style="width: 8%; text-align:center;">判定</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {item_rows_html}
-                        </tbody>
-                    </table>
-                </div>
                 """
+
+                pages_detail_blocks += detail_content
 
             pdf_cards_html += f"""
             <div class="pdf-card">
@@ -502,8 +653,7 @@ def run_evaluation_process():
                                     <th style="text-align:center;">ページ</th>
                                     <th>帳票タイトル</th>
                                     <th style="text-align:center;">分類</th>
-                                    <th style="text-align:center;">正解数 / 項目数</th>
-                                    <th style="text-align:center;">正解率</th>
+                                    <th style="text-align:center;" colspan="2">OCR評価</th>
                                 </tr>
                             </thead>
                             <tbody>
@@ -673,6 +823,18 @@ def run_evaluation_process():
         .result-ng {{
             color: #ff4560;
             font-weight: bold;
+        }}
+        .result-na {{
+            color: #d9b3ff;
+            font-weight: bold;
+        }}
+        .not-evaluated {{
+            padding: 16px;
+            text-align: center;
+            color: #d9b3ff;
+            background: #202020;
+            border: 1px solid #444;
+            border-radius: 6px;
         }}
         .export-note {{
             color: #8E5F69;
