@@ -1,6 +1,8 @@
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
 import re
+import os
+import csv
 import pandas as pd
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
@@ -50,7 +52,8 @@ class KessanExcelExporter:
         "01_030_02": "製造原価報告書",
         "01_040_02": "販売費及び一般管理費明細書",
         "01_050_02": "株主資本等変動計算書",
-        "個別注記表": "個別注記表"
+        "01_060_02": "キャッシュ・フロー計算書",
+        "01_070_02": "個別注記表"
     }
 
     @classmethod
@@ -88,6 +91,255 @@ class KessanExcelExporter:
         return default_title
     
     @classmethod
+    def detect_page_sections(cls, df_page: pd.DataFrame, primary_title: str) -> List[Dict[str, Any]]:
+        """1物理ページ内で、評価対象として特定できる論理帳票だけを分離する。
+
+        重要: 「科目」が再登場しただけでは分割しない。
+        現時点では、再登場後に棚卸資産特有の科目が複数確認できた場合のみ
+        「棚卸資産」として独立評価する。特定できない候補は primary_title に含めたままにする。
+        """
+        if df_page is None or df_page.empty:
+            return [{"start": 0, "end": 0, "label": primary_title, "inferred": False}]
+
+        accounts = []
+        for _, row in df_page.iterrows():
+            gt = cls.clean_str(row.get("c0_gt", ""))
+            pdv = cls.clean_str(row.get("c0_pd", ""))
+            accounts.append(gt or pdv)
+
+        # 「account」はCSVのシステムヘッダなので帳票境界には使わない。
+        # 最初の「科目」は主帳票自身のヘッダ。2回目以降の「科目」だけを
+        # ページ内の別帳票候補として扱う。
+        subject_headers = [
+            i for i, text in enumerate(accounts)
+            if cls.normalize_text(text) == "科目"
+        ]
+        candidates = subject_headers[1:]
+
+        inventory_terms = {
+            cls.normalize_text(v) for v in
+            {"製品", "商品", "原材料", "材料", "仕掛品", "半成品", "仕掛品(半成品)", "貯蔵品"}
+        }
+
+        inventory_start = None
+        for pos, start in enumerate(candidates):
+            end = candidates[pos + 1] if pos + 1 < len(candidates) else len(accounts)
+            sec_norms = {cls.normalize_text(v) for v in accounts[start:end] if cls.normalize_text(v)}
+            hit_count = len(inventory_terms & sec_norms)
+            if hit_count >= 2:
+                inventory_start = start
+                break
+
+        if inventory_start is None:
+            return [{"start": 0, "end": len(accounts), "label": primary_title, "inferred": False}]
+
+        return [
+            {"start": 0, "end": inventory_start, "label": primary_title, "inferred": False},
+            {"start": inventory_start, "end": len(accounts), "label": "棚卸資産", "inferred": True},
+        ]
+
+    @classmethod
+    def calc_section_accuracy(cls, df_page: pd.DataFrame, start: int, end: int) -> Tuple[int, int, float]:
+        """詳細DataFrameの指定範囲を、Excel詳細と同じセル単位ルールで採点する。"""
+        total = 0
+        matches = 0
+        c_indices = sorted({
+            int(m.group(1))
+            for col in df_page.columns
+            for m in [re.fullmatch(r"c(\d+)_gt", str(col))]
+            if m
+        })
+        rows = list(df_page.iloc[start:end].iterrows())
+        for _, row in rows:
+            c0_gt = cls.clean_str(row.get("c0_gt", ""))
+            c0_pd = cls.clean_str(row.get("c0_pd", ""))
+            if cls.is_system_header_row(c0_gt, c0_pd):
+                continue
+            for i in c_indices:
+                gt = cls.clean_str(row.get(f"c{i}_gt", ""))
+                pdv = cls.clean_str(row.get(f"c{i}_pd", ""))
+                ngt, npd = cls.normalize_text(gt), cls.normalize_text(pdv)
+                if not ngt and not npd:
+                    continue
+                total += 1
+                if ngt == npd:
+                    matches += 1
+        acc = matches / total if total else 0.0
+        return matches, total, acc
+
+    @classmethod
+    def get_inventory_stats(cls, page_df_list: List[Tuple[str, pd.DataFrame]]) -> Tuple[int, int, float]:
+        """1PDF内の棚卸資産セクションだけを集計する。"""
+        matches = total = 0
+        for raw_title, df_page in page_df_list:
+            if bool(df_page.attrs.get("missing_detail", False)) or bool(df_page.attrs.get("classification_mismatch", False)):
+                continue
+            primary = cls.get_title_from_df(df_page, raw_title)
+            for sec in cls.detect_page_sections(df_page, primary):
+                if sec["label"] == "棚卸資産":
+                    m, t, _ = cls.calc_section_accuracy(df_page, sec["start"], sec["end"])
+                    matches += m
+                    total += t
+        return matches, total, (matches / total if total else 0.0)
+
+    @classmethod
+    def get_classification_stats(cls, page_df_list: List[Tuple[str, pd.DataFrame]]) -> Tuple[int, int]:
+        """Markdown/GUI本体と同じ考え方で分類対象ページを集計する。
+
+        - 表紙など「評価対象外（不明）」だけを分母から除外
+        - 分類不一致ページは、明細CSVがなくても分母に含めて不正解にする
+        - 「決算書帳票」のような汎用タイトルでも、明細が存在して分類一致なら正解として数える
+        - 個別注記表など既知formidの分類のみ評価ページも分母に含める
+        """
+        known_titles = set(cls.FORM_ID_MAP.values())
+        matches = total = 0
+
+        for raw_title, df_page in page_df_list:
+            is_missing_detail = bool(df_page.attrs.get("missing_detail", False))
+            is_classification_mismatch = bool(df_page.attrs.get("classification_mismatch", False))
+            title = cls.get_title_from_df(df_page, raw_title)
+
+            # 分類不一致は必ず「分類対象の不正解」。
+            # 明細CSVなしだからといって分母から落としてはいけない。
+            if is_classification_mismatch:
+                total += 1
+                continue
+
+            # 明細が存在するページは evaluator が分類一致として detail_dfs に載せているため、
+            # formidから帳票名を特定できない「決算書帳票」等も分類正解として数える。
+            if not is_missing_detail:
+                total += 1
+                matches += 1
+                continue
+
+            # 明細CSVがなくても、既知帳票として分類だけ評価されるページは正解扱い。
+            if title in known_titles:
+                total += 1
+                matches += 1
+                continue
+
+            # それ以外（決算報告書の表紙など）は「評価対象外（不明）」なので数えない。
+
+        return matches, total
+
+    @classmethod
+    def get_classification_stats_from_results(
+        cls, output_path: Path
+    ) -> Dict[str, Tuple[int, int]]:
+        """GUI/Markdownと同じ full_comparison 分類CSVからPDF別の分類結果を作る。
+
+        detail_dfs から分類を推測しない。
+        results 配下の通常CSV（_detail以外）の c1_gt / c1_pd を直接読み、
+        GT formid が存在するページだけを分類対象にする。
+        同名CSVが複数ある場合はGUIと同じく最新更新ファイルを採用する。
+        """
+        results_dir = Path(output_path).parent
+        if results_dir.name.lower() != "results":
+            # 通常は results/決算5表_精度評価マトリックス.xlsx。
+            # 念のため親を遡って results を探す。
+            for parent in Path(output_path).parents:
+                if parent.name.lower() == "results":
+                    results_dir = parent
+                    break
+
+        latest_files_map: Dict[str, Tuple[Path, float]] = {}
+
+        if results_dir.exists():
+            for root, _, files in os.walk(results_dir):
+                for name in files:
+                    if not name.endswith(".csv"):
+                        continue
+                    if "full_comparison" not in name:
+                        continue
+                    if "_detail" in name:
+                        continue
+
+                    fp = Path(root) / name
+                    try:
+                        mtime = fp.stat().st_mtime
+                    except OSError:
+                        continue
+
+                    prev = latest_files_map.get(name)
+                    if prev is None or mtime > prev[1]:
+                        latest_files_map[name] = (fp, mtime)
+
+        stats: Dict[str, List[int]] = {}
+
+        for fp, _ in latest_files_map.values():
+            gt_formid = ""
+            pd_formid = ""
+
+            try:
+                with open(fp, "r", encoding="utf-8-sig", newline="") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        gt_raw = str(row.get("c1_gt", "") or "").strip()
+                        pd_raw = str(row.get("c1_pd", "") or "").strip()
+
+                        # c1_gt/c1_pd は formid だけとは限らないため、
+                        # セル値の完全一致ではなく既知formidを文字列中から抽出する。
+                        if not gt_formid:
+                            for f_id in cls.FORM_ID_MAP:
+                                if f_id in gt_raw:
+                                    gt_formid = f_id
+                                    break
+
+                        if not pd_formid:
+                            for f_id in cls.FORM_ID_MAP:
+                                if f_id in pd_raw:
+                                    pd_formid = f_id
+                                    break
+
+                        if gt_formid and pd_formid:
+                            break
+            except Exception:
+                continue
+
+            # GT側に既知formidが無いページ（決算報告書の表紙など）だけ評価対象外。
+            # PD側が不明・別formidでもGTが既知なら「分類不一致」として分母には残す。
+            if not gt_formid:
+                continue
+
+            file_stem = (
+                fp.name
+                .replace("full_comparison_", "")
+                .replace("diff_list_", "")
+                .replace(".csv", "")
+            )
+
+            # 末尾 _0, _1 ... がページ番号なのでPDF名から外す。
+            pdf_name = re.sub(r"_\d+$", "", file_stem)
+
+            bucket = stats.setdefault(pdf_name, [0, 0])  # matches, total
+            bucket[1] += 1
+            if gt_formid == pd_formid:
+                bucket[0] += 1
+
+        return {name: (v[0], v[1]) for name, v in stats.items()}
+
+    @classmethod
+    def get_primary_statement_stats(cls, page_df_list: List[Tuple[str, pd.DataFrame]]) -> Dict[str, Tuple[int, int, float]]:
+        """決算5表の主帳票を単独採点する。棚卸資産同居時は主帳票から切り離す。"""
+        five_titles = {
+            "貸借対照表 (BS)", "損益計算書 (PL)", "製造原価報告書",
+            "販売費及び一般管理費明細書", "株主資本等変動計算書"
+        }
+        result: Dict[str, List[int]] = {}
+        for raw_title, df_page in page_df_list:
+            if bool(df_page.attrs.get("missing_detail", False)) or bool(df_page.attrs.get("classification_mismatch", False)):
+                continue
+            primary = cls.get_title_from_df(df_page, raw_title)
+            if primary not in five_titles:
+                continue
+            main = cls.detect_page_sections(df_page, primary)[0]
+            m, t, _ = cls.calc_section_accuracy(df_page, main["start"], main["end"])
+            bucket = result.setdefault(primary, [0, 0])
+            bucket[0] += m
+            bucket[1] += t
+        return {k: (v[0], v[1], (v[0] / v[1] if v[1] else 0.0)) for k, v in result.items()}
+
+    @classmethod
     def export_kessan_report(
         cls, 
         output_path: Path, 
@@ -108,9 +360,9 @@ class KessanExcelExporter:
         headers = [
             "No", "PDFファイル名", "総ページ数",
             "分類正解数", "分類総数", "分類正解率",
-            "OCR総項目数", "OCR正解数", "OCR正解率",
-            "BS", "PL", "製造原価", "販管費", "株主資本"
-]
+            "総項目数", "正解数", "正解率",
+            "BS", "PL", "製造原価", "販管費", "株主資本", "棚卸資産"
+        ]
 
         for col_idx, header in enumerate(headers, start=1):
             cell = ws_matrix.cell(row=2, column=col_idx, value=header)
@@ -127,6 +379,25 @@ class KessanExcelExporter:
             "製造原価": ["製造原価", "製造原価_acc", "製造原価報告書", "製造原価報告書_acc"],
             "販管費": ["販管費", "販管費_acc", "販売費及び一般管理費明細書", "販売費及び一般管理費明細書_acc"],
             "株主資本": ["株主資本", "株主資本_acc", "株主資本等変動計算書", "株主資本等変動計算書_acc"]
+        }
+
+        # PDF名 -> 棚卸資産セクション単独の (正解数, 総項目数, 正解率)
+        inventory_stats = {
+            sheet_name: cls.get_inventory_stats(page_df_list)
+            for sheet_name, page_df_list in detail_dfs
+        }
+
+        # 分類はGUI/Markdownと同じ results 配下の分類CSVを直接集計する。
+        # detail_dfs からの推測は、分類×ページや「決算書帳票」でズレるため使わない。
+        classification_stats = cls.get_classification_stats_from_results(output_path)
+
+        # GUI/Markdownでは「決算報告書（表紙）」等の不明ページは
+        # 分類評価の分母から除外される。
+        # 一方 summary_data の classification_total は物理ページ数になる場合があるため、
+        # detail_dfs に存在する「表紙」ページ数だけを明示的に差し引く。
+        primary_statement_stats = {
+            sheet_name: cls.get_primary_statement_stats(page_df_list)
+            for sheet_name, page_df_list in detail_dfs
         }
 
         row_idx = 3
@@ -147,17 +418,25 @@ class KessanExcelExporter:
             c3.number_format = '#,##0'
             c3.alignment = Alignment(horizontal="center", vertical="center")
 
-            # 分類
-            c4 = ws_matrix.cell(row=row_idx, column=4, value=data.get("classification_matches", 0))
+            # 分類集計は detail_dfs 側で「formid が判定できる分類対象ページ」だけを数える。
+            # 表紙など formid 不明の評価対象外ページは分母から除外する。
+            # summary_data の total_pages / classification_total をそのまま使うと、
+            # 評価対象外ページまで分類総数に入るケースがあるため使用しない。
+            filename = data.get("filename", "")
+
+            # 分類は修正済みEvaluator本体の確定値をそのまま使用する。
+            # Excel側では分類を再計算しない。
+            classification_matches = int(data.get("classification_matches", 0) or 0)
+            classification_total = int(data.get("classification_total", 0) or 0)
+
+            c4 = ws_matrix.cell(row=row_idx, column=4, value=classification_matches)
             c4.number_format = '#,##0'
             c4.alignment = Alignment(horizontal="center", vertical="center")
 
-            c5 = ws_matrix.cell(row=row_idx, column=5, value=data.get("classification_total", 0))
+            c5 = ws_matrix.cell(row=row_idx, column=5, value=classification_total)
             c5.number_format = '#,##0'
             c5.alignment = Alignment(horizontal="center", vertical="center")
 
-            classification_total = data.get("classification_total", 0)
-            classification_matches = data.get("classification_matches", 0)
             classification_acc = (
                 classification_matches / classification_total
                 if classification_total > 0
@@ -183,21 +462,35 @@ class KessanExcelExporter:
             c9.alignment = Alignment(horizontal="center", vertical="center")
             
             kessan_types = ["BS", "PL", "製造原価", "販管費", "株主資本"]
+            title_for_type = {
+                "BS": "貸借対照表 (BS)",
+                "PL": "損益計算書 (PL)",
+                "製造原価": "製造原価報告書",
+                "販管費": "販売費及び一般管理費明細書",
+                "株主資本": "株主資本等変動計算書",
+            }
+            pdf_primary_stats = primary_statement_stats.get(filename, {})
+            # ここはページ全体の旧summary値ではなく、detect_page_sections()で分けた
+            # 論理帳票単独値だけを使う（例: 227 P3 販管費 57/59、棚卸資産 11/11）。
             for c_offset, k_type in enumerate(kessan_types, start=10):
-                status_val = "-"
-                for alt_key in kessan_map[k_type]:
-                    if alt_key in data:
-                        status_val = data[alt_key]
-                        break
-
+                stat = pdf_primary_stats.get(title_for_type[k_type])
                 c = ws_matrix.cell(row=row_idx, column=c_offset)
-                if isinstance(status_val, (int, float)):
-                    c.value = status_val / 100.0 if status_val > 1 else status_val
+                if stat and stat[1] > 0:
+                    c.value = stat[2]
                     c.number_format = '0.0%'
                 else:
-                    c.value = str(status_val)
-                
+                    c.value = "-"
                 c.alignment = Alignment(horizontal="center", vertical="center")
+
+            # 棚卸資産はページ内論理帳票として独立採点（AIReadのformidとは別）
+            inv_matches, inv_total, inv_acc = inventory_stats.get(filename, (0, 0, 0.0))
+            c15 = ws_matrix.cell(row=row_idx, column=15)
+            if inv_total > 0:
+                c15.value = inv_acc
+                c15.number_format = '0.0%'
+            else:
+                c15.value = "-"
+            c15.alignment = Alignment(horizontal="center", vertical="center")
 
             for col in range(1, len(headers) + 1):
                 c = ws_matrix.cell(row=row_idx, column=col)
@@ -278,7 +571,7 @@ class KessanExcelExporter:
         ocr_tot_acc.alignment = Alignment(horizontal="center", vertical="center")
 
         # 帳票別平均
-        col_letters = ['J', 'K', 'L', 'M', 'N']
+        col_letters = ['J', 'K', 'L', 'M', 'N', 'O']
 
         for c_let in col_letters:
             col_cell = ws_matrix.cell(
@@ -307,6 +600,7 @@ class KessanExcelExporter:
 
         for c_letter in col_letters:
             ws_matrix.column_dimensions[c_letter].width = 16
+        ws_matrix.column_dimensions['O'].width = 16
 
         # -------------------------------------------------------------
         # シート2以降: 📄 詳細シート
@@ -385,19 +679,40 @@ class KessanExcelExporter:
 
             current_row = 5
 
-            for raw_p_title, df_page in page_df_list:
+            for page_no, (raw_p_title, df_page) in enumerate(page_df_list, start=1):
                 # detail CSVが存在しないページかどうか
                 is_missing_detail = bool(df_page.attrs.get("missing_detail", False))
                 is_classification_mismatch = bool(df_page.attrs.get("classification_mismatch", False))
-                is_classification_excluded = bool(df_page.attrs.get("classification_excluded", False))
-                is_ocr_excluded = bool(df_page.attrs.get("ocr_excluded", False))
 
-                # 通常ページはformidからタイトル取得、評価対象外/採点対象外ページはGTタイトルを使う
+                # 通常ページはformidからタイトル取得、detailなしページはGTのタイトルをそのまま使う
                 p_title = (
                     raw_p_title
-                    if is_missing_detail or is_classification_mismatch or is_classification_excluded or is_ocr_excluded
+                    if is_missing_detail or is_classification_mismatch
                     else cls.get_title_from_df(df_page, raw_p_title)
                 )
+
+                page_sections = (
+                    cls.detect_page_sections(df_page, p_title)
+                    if not is_missing_detail and not is_classification_mismatch
+                    else [{"start": 0, "end": len(df_page), "label": p_title, "inferred": False}]
+                )
+                # 複数帳票ページだけ、各帳票の先頭に水色の帳票別ヘッダを表示する。
+                # 1帳票ページは従来どおりピンクのページヘッダだけにする。
+                section_start_map = (
+                    {sec["start"]: sec for sec in page_sections}
+                    if len(page_sections) > 1
+                    else {}
+                )
+                section_end_map = {sec["end"]: sec for sec in page_sections}
+                section_counts = {i: [0, 0] for i in range(len(page_sections))}  # total, matches
+
+                # 水色ヘッダに帳票単独の総数・正解数・正解率を先に表示するため事前計算
+                section_display_stats = {}
+                for sec in page_sections:
+                    sec_matches, sec_total, sec_acc = cls.calc_section_accuracy(
+                        df_page, sec["start"], sec["end"]
+                    )
+                    section_display_stats[sec["start"]] = (sec_matches, sec_total, sec_acc)
                 
                 title_row_idx = current_row
                 ws_detail.merge_cells(
@@ -409,42 +724,6 @@ class KessanExcelExporter:
                 ws_detail.row_dimensions[title_row_idx].height = 22
                 current_row += 1
                 
-                # 「不明」は正しい対象外判定。分類/OCRのどちらにも入れず、存在だけ表示する。
-                if is_classification_excluded:
-                    ws_detail.merge_cells(
-                        start_row=current_row,
-                        start_column=1,
-                        end_row=current_row,
-                        end_column=total_cols_count
-                    )
-
-                    msg_cell = ws_detail.cell(
-                        row=current_row,
-                        column=1,
-                        value="分類：評価対象外（不明） ／ OCR：評価対象外"
-                    )
-                    msg_cell.fill = cls.HEADER_ROW_FILL
-                    msg_cell.font = cls.HEADER_ROW_FONT
-                    msg_cell.alignment = Alignment(horizontal="center", vertical="center")
-
-                    for c_idx in range(1, total_cols_count + 1):
-                        ws_detail.cell(row=current_row, column=c_idx).border = cls.THIN_BORDER
-
-                    title_text = (
-                        f"📄 {p_title}   "
-                        "【分類：評価対象外（不明）／OCR：評価対象外】"
-                    )
-                    title_cell = ws_detail.cell(row=title_row_idx, column=1, value=title_text)
-                    title_cell.fill = cls.PAGE_TITLE_FILL
-                    title_cell.font = cls.PAGE_TITLE_FONT
-                    title_cell.alignment = Alignment(horizontal="left", vertical="center")
-
-                    for c_idx in range(1, total_cols_count + 1):
-                        ws_detail.cell(row=title_row_idx, column=c_idx).border = cls.THIN_BORDER
-
-                    current_row += 1
-                    continue
-
                 # 分類が不一致のページは、OCR採点対象外として表示する
                 if is_classification_mismatch:
                     ws_detail.merge_cells(
@@ -473,26 +752,6 @@ class KessanExcelExporter:
                     continue                                
 
                 # detail CSVが無いページは、OCR採点せずExcelには存在だけ残す
-                if is_ocr_excluded:
-                    ws_detail.merge_cells(
-                        start_row=current_row, start_column=1,
-                        end_row=current_row, end_column=total_cols_count
-                    )
-                    msg_cell = ws_detail.cell(
-                        row=current_row, column=1,
-                        value="分類は評価対象 ／ OCR：評価対象外（分類のみ評価）"
-                    )
-                    msg_cell.fill = cls.HEADER_ROW_FILL
-                    msg_cell.font = cls.HEADER_ROW_FONT
-                    msg_cell.alignment = Alignment(horizontal="center", vertical="center")
-                    for c_idx in range(1, total_cols_count + 1):
-                        ws_detail.cell(row=current_row, column=c_idx).border = cls.THIN_BORDER
-                    ws_detail.cell(row=title_row_idx, column=1).value = (
-                        f"📄 {p_title}   【OCR：評価対象外（分類のみ評価）】"
-                    )
-                    current_row += 2
-                    continue
-
                 if is_missing_detail:
                     ws_detail.merge_cells(
                         start_row=current_row,
@@ -546,7 +805,33 @@ class KessanExcelExporter:
                 col_item_counts = [0] * max_c_count
                 col_match_counts = [0] * max_c_count
 
-                for _, row_series in df_page.iterrows():
+                current_section_idx = 0
+                for row_pos, (_, row_series) in enumerate(df_page.iterrows()):
+                    # 2つ目以降の論理帳票の開始位置に、Excel上の区切り見出しを挿入
+                    if row_pos in section_start_map:
+                        sec = section_start_map[row_pos]
+                        ws_detail.merge_cells(
+                            start_row=current_row, start_column=1,
+                            end_row=current_row, end_column=total_cols_count
+                        )
+                        sec_matches, sec_total, sec_acc = section_display_stats[sec["start"]]
+                        sec_cell = ws_detail.cell(
+                            row=current_row, column=1,
+                            value=(
+                                f"▶ {sec['label']}   "
+                                f"【全 {sec_total} 項目 | 正解: {sec_matches} | 正解率: {sec_acc:.1%}】"
+                            )
+                        )
+                        sec_cell.fill = cls.LIGHT_BLUE_FILL
+                        sec_cell.font = cls.SUBTOTAL_FONT
+                        sec_cell.alignment = Alignment(horizontal="left", vertical="center")
+                        for col_i in range(1, total_cols_count + 1):
+                            ws_detail.cell(row=current_row, column=col_i).border = cls.THIN_BORDER
+                        current_row += 1
+                        # 先頭帳票にも水色ヘッダを出すため、単純な +1 ではなく
+                        # 実際の section 番号を設定する。
+                        current_section_idx = page_sections.index(sec)
+
                     row_dict = row_series.to_dict()
 
                     c0_gt_raw = cls.clean_str(row_dict.get('c0_gt', ''))
@@ -603,6 +888,10 @@ class KessanExcelExporter:
                                         row_matched_cells += 1
                                         col_match_counts[c_i] += 1
 
+                    if not is_sys_row:
+                        section_counts[current_section_idx][0] += row_total_cells
+                        section_counts[current_section_idx][1] += row_matched_cells
+
                     acc_c = ws_detail.cell(row=current_row, column=total_cols_count)
                     if is_sys_row:
                         acc_c.value = "-"
@@ -623,6 +912,7 @@ class KessanExcelExporter:
                     current_row += 1
                     if not is_sys_row:
                         item_no += 1
+
 
                 subtotal_row = current_row
                 ws_detail.row_dimensions[subtotal_row].height = 22
@@ -659,7 +949,20 @@ class KessanExcelExporter:
                 current_row += 1
 
                 p_acc_percent = (total_page_matches / total_page_items * 100) if total_page_items > 0 else 100.0
-                title_text = f"📄 {p_title}   【全 {total_page_items} 項目 | 正解: {total_page_matches} | ページ総合正解率: {p_acc_percent:.1f}%】"
+
+                # ピンク = 物理ページ全体、水色 = ページ内の各論理帳票。
+                # 複数帳票ページでも、ピンク側には帳票別成績を重複表示しない。
+                if len(page_sections) > 1:
+                    logical_labels = " ＋ ".join(sec["label"] for sec in page_sections)
+                    title_text = (
+                        f"📄 P{page_no} 【ページ全体：{logical_labels}】   "
+                        f"【全 {total_page_items} 項目 | 正解: {total_page_matches} | 正解率: {p_acc_percent:.1f}%】"
+                    )
+                else:
+                    title_text = (
+                        f"📄 P{page_no} {p_title}   "
+                        f"【全 {total_page_items} 項目 | 正解: {total_page_matches} | 正解率: {p_acc_percent:.1f}%】"
+                    )
 
                 t_cell = ws_detail.cell(row=title_row_idx, column=1, value=title_text)
                 t_cell.fill = cls.PAGE_TITLE_FILL
