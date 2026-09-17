@@ -25,14 +25,8 @@ class Csv4dbEvaluator:
         "01_020_02": "損益計算書 (PL)",
         "01_030_02": "製造原価報告書",
         "01_040_02": "販売費及び一般管理費明細書",
-        "01_050_02": "株主資本等変動計算書",
-        # 決算5表のデータ化対象外ページ。物理ページとしては残すが採点しない。
-        "不明": "決算報告書（表紙）",
-        "個別注記表": "個別注記表",
+        "01_050_02": "株主資本等変動計算書"
     }
-
-    EXCLUDED_FORM_ID = "不明"
-    OCR_EXCLUDED_FORM_IDS = {"不明", "個別注記表"}
 
     def __init__(self, session: str, prediction_dir: Path, ground_truth_dir: Path, results_base_dir: Path) -> None:
         self.session: str = session
@@ -81,7 +75,6 @@ class Csv4dbEvaluator:
         """
         # prediction files（比較対象ファイル）
         pd_files = [f for f in sorted(self.predictions_dir.iterdir()) if f.is_file() and f.suffix == '.csv']
-        pd_file_names = {f.name for f in pd_files}
         num_of_file = len(pd_files)
         
         # 統計集計用に (ファイル名, 統合データフレーム) のリストを保持
@@ -126,52 +119,6 @@ class Csv4dbEvaluator:
             # 統計用に結果を保存
             evaluation_results.append((pd_file.name, merged_df))
 
-        # Prediction側に通常CSV自体が作られなかったページも、
-        # GTに存在する物理ページとしてレポートに残す。
-        # これにより「分類対象だがAIReadが不明/未出力」のページも分類×として評価できる。
-        for gt_file in sorted(self.ground_truth_dir.iterdir()):
-            if (
-                not gt_file.is_file()
-                or gt_file.suffix != ".csv"
-                or "_detail" in gt_file.name
-                or gt_file.name in pd_file_names
-            ):
-                continue
-
-            logging.info(
-                f"📄 Prediction未出力ページをGTから補完: {gt_file.name} "
-                "(Prediction CSVなし)"
-            )
-
-            # 列・行の形だけGTと揃えてから、Predictionの実データ部分を空にする。
-            gt_df, pd_df = self._load_csv_to_dataframe(gt_file, gt_file)
-            if gt_df is None or pd_df is None:
-                continue
-
-            gt_df, pd_df = self._align_columns_by_fuzzy_match(gt_df, pd_df)
-            gt_df, pd_df = self._align_rows_by_fuzzy_match(gt_df, pd_df)
-
-            for col in [c for c in pd_df.columns if c.endswith("_pd")]:
-                pd_df.loc[pd_df["row_id"] != "r0", col] = ""
-
-            merged_df = pandas.merge(
-                gt_df, pd_df, on="row_id", how="outer",
-                indicator="row_presence", validate="many_to_many"
-            ).fillna("")
-
-            merged_df["r_num"] = merged_df["row_id"].str.extract(r"(\d+)").astype(int)
-            merged_df["r_has_extra"] = merged_df["row_id"].str.startswith("extra").astype(int)
-            merged_df = merged_df.sort_values(by=["r_num", "r_has_extra"])
-            merged_df = merged_df.drop(columns=["r_num", "r_has_extra"]).reset_index(drop=True)
-
-            merged_df[["item_count", "match_count", "accuracy"]] = merged_df.apply(
-                self._calc_data_accuracy_by_row, axis=1
-            )
-
-            diff_df = self._extract_differences(merged_df)
-            self._save_individual_reports(diff_df, merged_df, gt_file.name)
-            evaluation_results.append((gt_file.name, merged_df))
-
         # サマリーレポートの生成
         if evaluation_results:
             self._save_summary_report(evaluation_results)
@@ -212,8 +159,6 @@ class Csv4dbEvaluator:
                     # ページごとの帳票タイトルを分類CSVから取得
                     page_title_map = {}
                     classification_ok_map = {}
-                    classification_excluded_map = {}
-                    ocr_excluded_map = {}
 
                     for page_file_name, df in page_list:
                         if "_detail" not in page_file_name:
@@ -224,16 +169,13 @@ class Csv4dbEvaluator:
                                 pd_formid = str(row.get("c1_pd", "")).strip()
 
                                 if gt_formid and gt_formid != "formid":
-                                    is_excluded = (gt_formid == self.EXCLUDED_FORM_ID)
                                     title = self.FORM_ID_MAP.get(gt_formid)
 
                                     if title:
                                         page_title_map[page_key] = title
 
-                                    classification_excluded_map[page_key] = is_excluded
-                                    ocr_excluded_map[page_key] = (gt_formid in self.OCR_EXCLUDED_FORM_IDS)
                                     classification_ok_map[page_key] = (
-                                        False if is_excluded else gt_formid == pd_formid
+                                        gt_formid == pd_formid
                                     )
                                     break
                     
@@ -264,15 +206,19 @@ class Csv4dbEvaluator:
                                     pd_formid = pd
                                     break
 
-                            if gt_formid:
-                                # 物理ページ数には「不明（対象外）」も含める。
-                                total_pages += 1
+                            # GUI/Markdownと同じ分類対象判定に統一する。
+                            # 表紙など GT formid が空/unknown/none/不明 のページは評価対象外。
+                            # それ以外はFORM_ID_MAP未登録でも分類対象に残す。
+                            is_classification_target = (
+                                bool(gt_formid)
+                                and gt_formid.lower() not in {"unknown", "none", "不明"}
+                            )
 
-                                # ただし対象外ページは分類の分母・分子には入れない。
-                                if gt_formid != self.EXCLUDED_FORM_ID:
-                                    classification_total += 1
-                                    if gt_formid == pd_formid:
-                                        classification_matches += 1
+                            if is_classification_target:
+                                total_pages += 1
+                                classification_total += 1
+                                if gt_formid == pd_formid:
+                                    classification_matches += 1
 
                             continue
 
@@ -291,25 +237,15 @@ class Csv4dbEvaluator:
                             else 0
                         )
 
-                        # 「不明（対象外）」は分類/OCRとも採点しない。
-                        is_classification_excluded = classification_excluded_map.get(page_key, False)
-                        is_ocr_excluded = ocr_excluded_map.get(page_key, False)
+                        # 分類〇のページだけOCR集計に入れる
                         is_classification_ok = classification_ok_map.get(page_key, True)
 
-                        if is_classification_excluded:
-                            df.attrs["classification_excluded"] = True
-                        elif is_ocr_excluded:
-                            df.attrs["ocr_excluded"] = True
-                        elif is_classification_ok:
+                        if is_classification_ok:
                             total_items += item_sum
                             total_matches += match_sum
                         else:
                             # Excel表示用に「分類不一致」を記録
                             df.attrs["classification_mismatch"] = True
-
-                        page_idx_match = re.search(r"_(\d+)$", page_key)
-                        if page_idx_match:
-                            df.attrs["page_index"] = int(page_idx_match.group(1))
 
                         # GTの分類CSVから帳票タイトルを取得
                         detected_title = page_title_map.get(page_key)
@@ -319,41 +255,29 @@ class Csv4dbEvaluator:
                             detected_title = self._detect_title_by_formid(df)
 
                         if not detected_title:
-                            detected_title = f"決算書 ({page_file_name})"
+                            # FORM_ID_MAPに未登録でも、分類対象かつdetailがあるページは
+                            # Excel詳細から消さない。GUI/Markdownと同じ汎用タイトルにする。
+                            detected_title = "決算書帳票"
 
                         if detected_title in form_totals:
-                            # 帳票別OCR精度も分類〇だけ集計
-                            if (not is_classification_excluded) and is_classification_ok:
+                            # 決算5表として判定できたページだけ帳票別OCR精度へ集計
+                            if is_classification_ok:
                                 form_totals[detected_title][0] += match_sum
                                 form_totals[detected_title][1] += item_sum
 
-                            # 分類×でもExcel上からページ自体は消さない
-                            page_df_list.append((detected_title, df))
+                        # ★重要★
+                        # 詳細シートへの追加は form_totals の内外に関係なく行う。
+                        # これにより217のような「決算書帳票」も5ページすべて表示される。
+                        # 分類×ページも従来どおりExcel上から消さない。
+                        page_df_list.append((detected_title, df))
 
-                    # 分類CSVは存在するがdetail CSVが存在しないページもExcel表示用に残す。
-                    # 「不明（対象外）」は明細欠落ではなく、意図した評価対象外として扱う。
+                    # 分類CSVは存在するがdetail CSVが存在しないページをExcel表示用に残す
                     for page_key, page_title in page_title_map.items():
                         if page_key not in detail_page_keys:
                             missing_df = pandas.DataFrame()
-
-                            if classification_excluded_map.get(page_key, False):
-                                missing_df.attrs["classification_excluded"] = True
-                            elif ocr_excluded_map.get(page_key, False):
-                                missing_df.attrs["ocr_excluded"] = True
-                            else:
-                                missing_df.attrs["missing_detail"] = True
-
-                            page_idx_match = re.search(r"_(\d+)$", page_key)
-                            if page_idx_match:
-                                missing_df.attrs["page_index"] = int(page_idx_match.group(1))
-
-                            page_df_list.append((page_title, missing_df))
-
-                    # detailなしページを後から追加しても、PDFの物理ページ順を維持する。
-                    page_df_list.sort(
-                        key=lambda item: item[1].attrs.get("page_index", 999999)
-                    )
-
+                            missing_df.attrs["missing_detail"] = True
+                            page_df_list.append((page_title, missing_df))                            
+                            
                     def form_acc(title):
                         matches, items = form_totals[title]
                         return round(matches / items * 100, 1) if items > 0 else "-"
@@ -392,23 +316,6 @@ class Csv4dbEvaluator:
 
         else:
             logging.warning("❌ 評価対象データが見つかりません。")
-
-    def _is_excluded_classification_gt(self, gt_path: Path) -> bool:
-        """GTの通常分類CSVが「不明（評価対象外）」かを判定する。"""
-        import csv
-
-        try:
-            enc = fileutils.detect_encoding(gt_path)
-            with open(gt_path, "r", encoding=enc, newline="") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    formid = str(row.get("formid", "") or "").strip()
-                    if formid:
-                        return formid == self.EXCLUDED_FORM_ID
-        except Exception as e:
-            logging.warning(f"対象外GT判定エラー ({gt_path.name}): {e}")
-
-        return False
 
     def _detect_title_by_formid(self, df: pandas.DataFrame) -> Optional[str]:
         """データフレームの全セルからformid（01_010_02等）を検出し、正しい帳票タイトルを返す"""
@@ -721,38 +628,28 @@ class Csv4dbEvaluator:
         gt_df.insert(0, "row_id", "")
         pd_df.insert(0, "row_id", "")
 
-        gt_number = 0
-        extra_number = 0
-
-        for gt_idx, pd_idx in aligned:
-
+        # aligned の並び順そのものを row_id にする。
+        # 以前は Prediction 側だけの行を extra_r0, extra_r1... としていたため、
+        # 後段の自然順ソートで r0, extra_r0, r1, extra_r1... のように
+        # 本来の位置から離れて「互い違い」に表示されることがあった。
+        for pos, (gt_idx, pd_idx) in enumerate(aligned):
+            row_id = f"r{pos}"
             if gt_idx is not None:
-                row_id = f"r{gt_number}"
                 gt_df.loc[gt_idx, "row_id"] = row_id
+            if pd_idx is not None:
+                pd_df.loc[pd_idx, "row_id"] = row_id
 
-                if pd_idx is not None:
-                    pd_df.loc[pd_idx, "row_id"] = row_id
-
-                gt_number += 1
-
-            elif pd_idx is not None:
-                pd_df.loc[pd_idx, "row_id"] = (
-                    f"extra_r{extra_number}"
-                )
-                extra_number += 1
-
-        # 念のためrow_idが付かなかった行にもIDを付ける
+        # 念のため、対応復元に含まれなかった行があれば末尾へ送る。
+        next_pos = len(aligned)
         for idx in gt_df.index:
             if not gt_df.loc[idx, "row_id"]:
-                gt_df.loc[idx, "row_id"] = f"r{gt_number}"
-                gt_number += 1
+                gt_df.loc[idx, "row_id"] = f"r{next_pos}"
+                next_pos += 1
 
         for idx in pd_df.index:
             if not pd_df.loc[idx, "row_id"]:
-                pd_df.loc[idx, "row_id"] = (
-                    f"extra_r{extra_number}"
-                )
-                extra_number += 1
+                pd_df.loc[idx, "row_id"] = f"r{next_pos}"
+                next_pos += 1
 
         return gt_df, pd_df
 

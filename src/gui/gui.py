@@ -204,8 +204,6 @@ def run_evaluation_process():
                 "classification_passed": 0,
                 "classification_gt": "",
                 "classification_pd": "",
-                "classification_excluded": False,
-                "ocr_excluded": False,
 
                 # OCR値評価
                 "page_total": 0,
@@ -243,25 +241,29 @@ def run_evaluation_process():
             except Exception as err:
                 print(f"❌ 分類CSV読み込みエラー ({file}): {err}")
 
-            classification_excluded = (gt_formid == "不明")
+            # 表紙など、正解formid自体がないページは分類評価対象外。
+            # 個別注記表など「分類のみ評価」の帳票はここでは除外しない。
+            if gt_formid == "" or gt_formid.lower() in {"unknown", "none", "不明"}:
+                page_data["classification_total"] = 0
+                page_data["classification_passed"] = 0
+                page_data["classification_gt"] = gt_formid
+                page_data["classification_pd"] = pd_formid
+                page_data["sheet_title"] = "決算報告書（表紙）"
+                page_data["ocr_status"] = "not_target"
+                continue
+
             classification_ok = (
-                not classification_excluded
-                and gt_formid != ""
-                and gt_formid == pd_formid
+                gt_formid == pd_formid
             )
 
-            page_data["classification_excluded"] = classification_excluded
-            page_data["ocr_excluded"] = (gt_formid in {"不明", "個別注記表"})
-            page_data["classification_total"] = 0 if classification_excluded else 1
+            page_data["classification_total"] = 1
             page_data["classification_passed"] = 1 if classification_ok else 0
             page_data["classification_gt"] = gt_formid
             page_data["classification_pd"] = pd_formid
 
-            # 「不明」は物理ページとして表示するが、分類の分母・分子には入れない。
-            if not classification_excluded:
-                classification_total += 1
-                if classification_ok:
-                    classification_passed += 1
+            classification_total += 1
+            if classification_ok:
+                classification_passed += 1
 
             # GTのformidから帳票名を決める
             form_id_map = {
@@ -270,8 +272,8 @@ def run_evaluation_process():
                 "01_030_02": "製造原価報告書",
                 "01_040_02": "販売費及び一般管理費明細書",
                 "01_050_02": "株主資本等変動計算書",
-                "不明": "決算報告書（表紙）",
-                "個別注記表": "個別注記表",
+                "01_060_02": "キャッシュ・フロー計算書",
+                "01_070_02": "個別注記表",
             }
 
             page_data["sheet_title"] = form_id_map.get(
@@ -285,16 +287,15 @@ def run_evaluation_process():
         # --------------------------------
         # OCR値評価（_detail.csv）
         # --------------------------------
-        page_data["detail_present"] = True
-
-        # 表紙や「分類のみ評価」の帳票は、detailの有無に関係なくOCR評価対象外。
-        if page_data.get("ocr_excluded", False):
-            page_data["ocr_status"] = "classification_excluded"
+        if page_data.get("ocr_status") == "not_target":
+            page_data["detail_present"] = False
             page_data["page_total"] = 0
             page_data["page_passed"] = 0
             page_data["page_acc"] = 0
             page_data["items"] = []
             continue
+
+        page_data["detail_present"] = True
 
         # 分類が不一致のページはOCR採点から完全に除外する。
         # detail CSVが存在していても0点として数えない。
@@ -378,11 +379,54 @@ def run_evaluation_process():
                         "no": idx,
                         "correct": correct_disp,
                         "recognized": recognized_disp,
-                        "is_ok": is_ok
+                        "is_ok": is_ok,
+                        "item_count": row_item_count,
+                        "match_count": row_match_count,
+                        "section": page_data.get("sheet_title", "決算書帳票")
                     })
 
         except Exception as err:
             print(f"❌ OCR詳細CSV読み込みエラー ({file}): {err}")
+
+        # 同一物理ページ内の「棚卸資産」を論理帳票として独立表示・集計する。
+        # 「科目」が再登場しただけでは分割しない。後続に棚卸資産特有の科目が
+        # 複数ある場合だけ、その位置以降を棚卸資産と判定する。
+        inventory_terms = {"製品", "商品", "原材料", "材料", "仕掛品", "半成品", "仕掛品(半成品)", "貯蔵品"}
+        candidate_positions = []
+        for pos, item in enumerate(page_items):
+            c = item.get("correct", "").replace(" ", "").replace("　", "")
+            r = item.get("recognized", "").replace(" ", "").replace("　", "")
+            if pos > 0 and (c == "項目:科目" or r == "項目:科目"):
+                candidate_positions.append(pos)
+
+        inventory_start = None
+        for pos_i, start_pos in enumerate(candidate_positions):
+            end_pos = candidate_positions[pos_i + 1] if pos_i + 1 < len(candidate_positions) else len(page_items)
+            tail_text = " ".join(
+                (it.get("correct", "") + " " + it.get("recognized", ""))
+                for it in page_items[start_pos:end_pos]
+            )
+            hits = sum(1 for term in inventory_terms if term in tail_text)
+            if hits >= 2:
+                inventory_start = start_pos
+                break
+
+        if inventory_start is not None:
+            for pos, item in enumerate(page_items):
+                item["section"] = "棚卸資産" if pos >= inventory_start else page_data.get("sheet_title", "決算書帳票")
+
+        section_stats = []
+        for section_name in dict.fromkeys(item.get("section", page_data.get("sheet_title", "決算書帳票")) for item in page_items):
+            sec_items = [it for it in page_items if it.get("section") == section_name]
+            sec_total = sum(it.get("item_count", 0) for it in sec_items)
+            sec_passed = sum(it.get("match_count", 0) for it in sec_items)
+            section_stats.append({
+                "title": section_name,
+                "total": sec_total,
+                "passed": sec_passed,
+                "acc": (sec_passed / sec_total * 100 if sec_total else 0.0)
+            })
+        page_data["section_stats"] = section_stats
 
         page_acc = (
             page_passed / page_total * 100
@@ -403,19 +447,7 @@ def run_evaluation_process():
     # detail無しを優先し、detail有り＋分類×だけ「分類不一致」とする。
     for pages in pdf_groups.values():
         for p in pages:
-            if p.get("classification_excluded", False):
-                p["ocr_status"] = "classification_excluded"
-                p["page_total"] = 0
-                p["page_passed"] = 0
-                p["page_acc"] = 0
-                p["items"] = []
-            elif p.get("ocr_excluded", False):
-                p["ocr_status"] = "ocr_excluded"
-                p["page_total"] = 0
-                p["page_passed"] = 0
-                p["page_acc"] = 0
-                p["items"] = []
-            elif not p.get("detail_present", False):
+            if not p.get("detail_present", False):
                 p["ocr_status"] = "missing_detail"
                 p["page_total"] = 0
                 p["page_passed"] = 0
@@ -447,7 +479,7 @@ def run_evaluation_process():
     
     with open(excel_export_path, "w", encoding="utf-8-sig", newline="") as ef:
         writer = csv.writer(ef)
-        writer.writerow(["PDFファイル名", "ページ番号", "帳票タイトル", "No", "マスタデータ", "AIRead読み取り結果", "判定(1/0)"])
+        writer.writerow(["PDFファイル名", "ページ番号", "AIRead分類帳票", "評価対象帳票", "No", "マスタデータ", "AIRead読み取り結果", "判定(1/0)"])
 
         for pdf_idx, (pdf_name, pages) in enumerate(sorted_pdf_groups, 1):
             pages = sorted(pages, key=lambda x: x["page_num"])
@@ -483,15 +515,13 @@ def run_evaluation_process():
             pages_detail_blocks = ""
 
             for p in pages:
-                p_classification_excluded = p.get("classification_excluded", False)
+                p_is_target = p["classification_total"] > 0
                 p_classification_ok = (
-                    not p_classification_excluded
-                    and p["classification_total"] > 0
+                    p_is_target
                     and p["classification_passed"] == p["classification_total"]
                 )
-
-                if p_classification_excluded:
-                    p_classification_class = "result-na"
+                if not p_is_target:
+                    p_classification_class = ""
                     p_classification_mark = "評価対象外（不明）"
                 else:
                     p_classification_class = "result-ok" if p_classification_ok else "result-ng"
@@ -499,32 +529,9 @@ def run_evaluation_process():
 
                 ocr_status = p.get("ocr_status", "")
 
-                if ocr_status == "classification_excluded":
+                if ocr_status == "not_target":
                     ocr_summary_text = "OCR評価対象外"
-                    ocr_summary_class = "result-na"
-                    detail_content = f"""
-                    <div class="page-detail-box">
-                        <div class="page-detail-header">
-                            <span>📄 ページ {p['page_num']}：{p['sheet_title']}</span>
-                            <span class="result-na">分類：評価対象外（不明） ／ OCR：評価対象外</span>
-                        </div>
-                        <div class="not-evaluated">分類：評価対象外（不明） ／ OCR：評価対象外</div>
-                    </div>
-                    """
-
-                elif ocr_status == "ocr_excluded":
-                    ocr_summary_text = "OCR評価対象外（分類のみ評価）"
-                    ocr_summary_class = "result-na"
-                    detail_content = f"""
-                    <div class="page-detail-box">
-                        <div class="page-detail-header">
-                            <span>📄 ページ {p['page_num']}：{p['sheet_title']}</span>
-                            <span class="result-na">OCR評価対象外（分類のみ評価）</span>
-                        </div>
-                        <div class="not-evaluated">分類は評価対象 ／ OCRは評価対象外</div>
-                    </div>
-                    """
-
+                    ocr_summary_class = ""
                 elif ocr_status == "classification_mismatch":
                     ocr_summary_text = "OCR評価対象外（分類不一致）"
                     ocr_summary_class = "result-na"
@@ -560,7 +567,19 @@ def run_evaluation_process():
                     ocr_summary_class = p_acc_class
 
                     item_rows_html = ""
+                    last_section = None
+                    section_stats_map = {x["title"]: x for x in p.get("section_stats", [])}
                     for item in p["items"]:
+                        section_name = item.get("section", p["sheet_title"])
+                        if section_name != last_section and len(p.get("section_stats", [])) > 1:
+                            st = section_stats_map.get(section_name, {})
+                            item_rows_html += f"""
+                            <tr class="section-row">
+                                <td colspan="4"><strong>▶ 評価対象帳票：{section_name}</strong>　
+                                単独正解率 {st.get('acc', 0):.1f}% ({st.get('passed', 0)}/{st.get('total', 0)})</td>
+                            </tr>
+                            """
+                            last_section = section_name
                         r_class = "result-ok" if item["is_ok"] else "result-ng"
                         r_mark = "〇" if item["is_ok"] else "✖"
                         item_rows_html += f"""
@@ -576,6 +595,7 @@ def run_evaluation_process():
                             pdf_name,
                             f"ページ {p['page_num']}",
                             p['sheet_title'],
+                            item.get('section', p['sheet_title']),
                             item['no'],
                             item['correct'],
                             item['recognized'],
