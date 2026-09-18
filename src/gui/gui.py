@@ -624,16 +624,27 @@ def run_evaluation_process():
                     </div>
                     """
 
+                if p_is_target:
+                    p_class_total = p["classification_total"]
+                    p_class_passed = p["classification_passed"]
+                    p_class_acc = (p_class_passed / p_class_total * 100) if p_class_total else 0
+                    p_class_total_text = str(p_class_total)
+                    p_class_passed_text = str(p_class_passed)
+                    p_class_acc_text = f"{p_class_acc:.1f}%"
+                else:
+                    p_class_total_text = "0"
+                    p_class_passed_text = "0"
+                    p_class_acc_text = "―"
+
                 pages_summary_rows += f"""
                 <tr>
                     <td style="text-align:center;">ページ {p['page_num']}</td>
                     <td style="font-weight:bold; color:#ff7bd5;">{p['sheet_title']}</td>
-                    <td class="{p_classification_class}" style="text-align:center;">
-                        {p_classification_mark}
-                    </td>
-                    <td class="{ocr_summary_class}" style="text-align:center;" colspan="2">
-                        {ocr_summary_text}
-                    </td>
+                    <td style="text-align:center;">{p_class_total_text}</td>
+                    <td style="text-align:center;">{p_class_passed_text}</td>
+                    <td class="{p_classification_class}" style="text-align:center;">{p_class_acc_text}</td>
+                    <td class="{p_classification_class}" style="text-align:center;">{p_classification_mark}</td>
+                    <td class="{ocr_summary_class}" style="text-align:center;">{ocr_summary_text}</td>
                 </tr>
                 """
 
@@ -672,8 +683,11 @@ def run_evaluation_process():
                                 <tr>
                                     <th style="text-align:center;">ページ</th>
                                     <th>帳票タイトル</th>
-                                    <th style="text-align:center;">分類</th>
-                                    <th style="text-align:center;" colspan="2">OCR評価</th>
+                                    <th style="text-align:center;">分類総数</th>
+                                    <th style="text-align:center;">分類正解数</th>
+                                    <th style="text-align:center;">分類正解率</th>
+                                    <th style="text-align:center;">判定</th>
+                                    <th style="text-align:center;">OCR評価</th>
                                 </tr>
                             </thead>
                             <tbody>
