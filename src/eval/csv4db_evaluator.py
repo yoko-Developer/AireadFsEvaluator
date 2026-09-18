@@ -145,6 +145,7 @@ class Csv4dbEvaluator:
 
                 summary_list = []
                 detail_dfs = []
+                classification_details = []
 
                 for pdf_name, page_list in pdf_groups.items():
                     total_pages = 0
@@ -213,6 +214,26 @@ class Csv4dbEvaluator:
                                 bool(gt_formid)
                                 and gt_formid.lower() not in {"unknown", "none", "不明"}
                             )
+
+                            # 分類結果詳細用に、評価対象外ページも含めて1ページ1行で保持する。
+                            page_match = re.search(r'_(\d+)\.csv$', page_file_name)
+                            page_no = int(page_match.group(1)) + 1 if page_match else ""
+                            gt_title = (
+                                self.FORM_ID_MAP.get(gt_formid, gt_formid)
+                                if is_classification_target
+                                else "評価対象外"
+                            )
+                            pd_title = self.FORM_ID_MAP.get(pd_formid, pd_formid or "不明")
+                            classification_details.append({
+                                "filename": pdf_name,
+                                "page": page_no,
+                                "gt_title": gt_title,
+                                "pd_title": pd_title,
+                                "gt_formid": gt_formid,
+                                "pd_formid": pd_formid,
+                                "is_target": is_classification_target,
+                                "is_match": is_classification_target and gt_formid == pd_formid,
+                            })
 
                             if is_classification_target:
                                 total_pages += 1
@@ -308,7 +329,9 @@ class Csv4dbEvaluator:
                     if page_df_list:
                         detail_dfs.append((pdf_name, page_df_list))
 
-                KessanExcelExporter.export_kessan_report(excel_output_path, summary_list, detail_dfs)
+                KessanExcelExporter.export_kessan_report(
+                    excel_output_path, summary_list, detail_dfs, classification_details
+                )
                 logging.info(f"✨ 決算5表マトリックスExcelを出力しました: {excel_output_path}")
 
             except Exception as e:

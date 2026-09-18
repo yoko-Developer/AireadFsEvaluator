@@ -344,7 +344,8 @@ class KessanExcelExporter:
         cls, 
         output_path: Path, 
         summary_data: List[Dict[str, Any]], 
-        detail_dfs: List[Tuple[str, List[Tuple[str, pd.DataFrame]]]]
+        detail_dfs: List[Tuple[str, List[Tuple[str, pd.DataFrame]]]],
+        classification_details: List[Dict[str, Any]] = None
     ) -> None:
         wb = openpyxl.Workbook()
         wb.remove(wb.active)
@@ -603,7 +604,148 @@ class KessanExcelExporter:
         ws_matrix.column_dimensions['O'].width = 16
 
         # -------------------------------------------------------------
-        # シート2以降: 📄 詳細シート
+        # シート2: 📊 分類結果マトリックス（ページ別）
+        # -------------------------------------------------------------
+        ws_class_matrix = wb.create_sheet(title="分類結果マトリックス")
+        ws_class_matrix.views.sheetView[0].showGridLines = False
+        ws_class_matrix.cell(row=1, column=1, value="帳票分類 ページ別マトリックス").font = cls.TITLE_FONT
+
+        sorted_class_details = sorted(classification_details or [], key=lambda x: (
+            int(re.search(r'株式会社(\d+)', str(x.get("filename", ""))).group(1))
+            if re.search(r'株式会社(\d+)', str(x.get("filename", ""))) else 999999999,
+            int(x.get("page", 999999999)) if str(x.get("page", "")).isdigit() else 999999999
+        ))
+        class_by_pdf = {}
+        max_page = 0
+        for item in sorted_class_details:
+            filename = str(item.get("filename", ""))
+            page = int(item.get("page", 0) or 0)
+            class_by_pdf.setdefault(filename, {})[page] = item
+            max_page = max(max_page, page)
+
+        # 1ページにつき「総数・正解数・正解率」の3列。評価対象外は 0 / 0 / -。
+        ws_class_matrix.merge_cells(start_row=2, start_column=1, end_row=3, end_column=1)
+        ws_class_matrix.merge_cells(start_row=2, start_column=2, end_row=3, end_column=2)
+        ws_class_matrix.cell(row=2, column=1, value="No")
+        ws_class_matrix.cell(row=2, column=2, value="PDFファイル名")
+        col = 3
+        for page in range(1, max_page + 1):
+            ws_class_matrix.merge_cells(start_row=2, start_column=col, end_row=2, end_column=col + 2)
+            ws_class_matrix.cell(row=2, column=col, value=f"P{page}")
+            for offset, label in enumerate(("総数", "正解数", "正解率")):
+                ws_class_matrix.cell(row=3, column=col + offset, value=label)
+            col += 3
+
+        for r in (2, 3):
+            for c in range(1, col):
+                cell = ws_class_matrix.cell(row=r, column=c)
+                cell.fill = cls.PASTEL_PINK_FILL
+                cell.font = cls.HEADER_FONT
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                cell.border = cls.THIN_BORDER
+
+        row = 4
+        for pdf_no, (filename, page_map) in enumerate(class_by_pdf.items(), 1):
+            ws_class_matrix.cell(row=row, column=1, value=pdf_no)
+            ws_class_matrix.cell(row=row, column=2, value=filename)
+            col = 3
+            for page in range(1, max_page + 1):
+                item = page_map.get(page)
+                if item is None:
+                    values = ("-", "-", "-")
+                elif bool(item.get("is_target", False)):
+                    passed = 1 if bool(item.get("is_match", False)) else 0
+                    values = (1, passed, passed)
+                else:
+                    values = (0, 0, "-")
+                for offset, value in enumerate(values):
+                    cell = ws_class_matrix.cell(row=row, column=col + offset, value=value)
+                    if offset == 2 and isinstance(value, (int, float)):
+                        cell.number_format = '0.0%'
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                col += 3
+            for c in range(1, col):
+                cell = ws_class_matrix.cell(row=row, column=c)
+                cell.font = cls.REGULAR_FONT
+                cell.border = cls.THIN_BORDER
+            row += 1
+
+        ws_class_matrix.freeze_panes = "C4"
+        ws_class_matrix.column_dimensions['A'].width = 6
+        ws_class_matrix.column_dimensions['B'].width = 38
+        for c in range(3, 3 + max_page * 3):
+            ws_class_matrix.column_dimensions[get_column_letter(c)].width = 11
+
+        # -------------------------------------------------------------
+        # シート3: 📋 分類結果詳細
+        # -------------------------------------------------------------
+        ws_class = wb.create_sheet(title="分類結果詳細")
+        ws_class.views.sheetView[0].showGridLines = False
+        ws_class.cell(row=1, column=1, value="帳票分類結果詳細").font = cls.TITLE_FONT
+
+        class_headers = [
+            "No", "PDFファイル名", "Page", "正解帳票", "AIRead分類結果",
+            "正解formid", "AIRead formid", "判定", "総数", "正解数", "正解率"
+        ]
+        for col_idx, header in enumerate(class_headers, start=1):
+            cell = ws_class.cell(row=2, column=col_idx, value=header)
+            cell.fill = cls.PASTEL_PINK_FILL
+            cell.font = cls.HEADER_FONT
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.border = cls.THIN_BORDER
+
+        def classification_sort_key(item):
+            filename = str(item.get("filename", ""))
+            m = re.search(r'株式会社(\d+)', filename)
+            company_no = int(m.group(1)) if m else 999999999
+            page = item.get("page", 999999999)
+            try:
+                page = int(page)
+            except (TypeError, ValueError):
+                page = 999999999
+            return company_no, page, filename
+
+        current_pdf = None
+        pdf_no = 0
+        row_idx_class = 3
+        for item in sorted(classification_details or [], key=classification_sort_key):
+            filename = str(item.get("filename", ""))
+            if filename != current_pdf:
+                pdf_no += 1
+                current_pdf = filename
+
+            is_target = bool(item.get("is_target", False))
+            judgment = "○" if item.get("is_match", False) else ("×" if is_target else "―")
+            values = [
+                pdf_no, filename, item.get("page", ""),
+                item.get("gt_title", ""), item.get("pd_title", ""),
+                item.get("gt_formid", ""), item.get("pd_formid", ""), judgment,
+                1 if is_target else 0,
+                1 if item.get("is_match", False) else 0,
+                (1 if item.get("is_match", False) else 0) if is_target else "-"
+            ]
+            for col_idx, value in enumerate(values, start=1):
+                cell = ws_class.cell(row=row_idx_class, column=col_idx, value=value)
+                cell.font = cls.REGULAR_FONT
+                cell.border = cls.THIN_BORDER
+                if col_idx == 11 and isinstance(value, (int, float)):
+                    cell.number_format = '0.0%'
+                cell.alignment = Alignment(
+                    horizontal="left" if col_idx in {2, 4, 5} else "center",
+                    vertical="center", wrap_text=True
+                )
+            row_idx_class += 1
+
+        ws_class.freeze_panes = "A3"
+        ws_class.auto_filter.ref = f"A2:K{max(2, row_idx_class - 1)}"
+        for col_letter, width in {
+            "A": 6, "B": 38, "C": 8, "D": 30, "E": 30,
+            "F": 16, "G": 16, "H": 8, "I": 9, "J": 9, "K": 11
+        }.items():
+            ws_class.column_dimensions[col_letter].width = width
+
+        # -------------------------------------------------------------
+        # シート4以降: 📄 詳細シート
         # -------------------------------------------------------------
         def company_number(item):
             sheet_name = item[0]
