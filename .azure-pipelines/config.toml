@@ -1,0 +1,4 @@
+[fs]
+airead_batch_file = "./data/row/fs/run_assort.bat"
+prediction_dir = "./data/row/fs/output"
+ground_truth_dir = "./data/ground_truth/fs"
