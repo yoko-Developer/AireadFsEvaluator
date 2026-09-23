@@ -1,0 +1,280 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+trigger:
+  branches:
+    include:
+    - main
+
+resources:
+  repositories:
+    - repository: AIReadAPI
+      type: git
+      name: AIReadAPI
+      ref: develop
+    - repository: AIReadEE
+      type: git
+      name: AIReadEE
+      ref: develop
+
+stages:
+- stage: BuildAIRead
+  jobs:
+  - job: BuildAIReadAPI
+    pool:
+      vmImage: 'windows-2025'
+    steps:
+    - checkout: AIReadAPI
+      lfs: true
+      persistCredentials: true
+    - task: MSBuild@1
+      displayName: 'Build AIReadCPP for 4000_MT_DLL'
+      inputs:
+        solution: '**/Tesseract.sln'
+        platform: 'x64'
+        configuration: '4000_MT_DLL'
+    - task: MSBuild@1
+      displayName: 'Build AIReadCPP for 4000_ST_DLL'
+      inputs:
+        solution: '**/Tesseract.sln'
+        platform: 'x64'
+        configuration: '4000_ST_DLL'
+    - task: MSBuild@1
+      displayName: 'Build AIReadCPP for 4100_MT_DLL'
+      inputs:
+        solution: '**/Tesseract.sln'
+        platform: 'x64'
+        configuration: '4100_MT_DLL'
+    - task: MSBuild@1
+      displayName: 'Build FormClassification'
+      inputs:
+        solution: '**/FormClassification.sln'
+        platform: 'x64'
+        configuration: 'DLL_EXPORT'
+    - task: CopyFiles@2
+      displayName: 'Copy DLL Files to AIReadAPI.Core.resources'
+      inputs:
+        SourceFolder: '$(Build.SourcesDirectory)'
+        Contents: |
+          AIReadCPP/x64/4000_MT_DLL/AIREAD_4000_4.dll
+          AIReadCPP/x64/4000_ST_DLL/AIREAD_4000_1.dll
+          AIReadCPP/x64/4100_MT_DLL/AIREAD_4100_4.dll
+          FormClassification/x64/DLL_EXPORT/formclassify.dll
+        TargetFolder: '$(Build.SourcesDirectory)/AIReadAPI/Core/src/main/resources/windows/x86_64'
+        OverWrite: true
+        flattenFolders: true
+    - task: Maven@4
+      displayName: 'Build AIReadAPICore'
+      inputs:
+        mavenPomFile: 'AIReadAPI/pom.xml'
+        mavenOptions: '-Xmx3072m'
+        javaHomeOption: 'JDKVersion'
+        jdkVersionOption: '1.21'
+        jdkArchitectureOption: 'x64'
+        mavenAuthenticateFeed: true # Azure Artifactsの認証突破のため
+        goals: 'package'
+    - task: CopyFiles@2
+      displayName: 'Copy AIReadAPICore.jar to staging directory'
+      inputs:
+        SourceFolder: '$(Build.SourcesDirectory)'
+        Contents: |
+          AIReadAPI/Core/target/AIReadAPICore.jar
+        TargetFolder: '$(Build.ArtifactStagingDirectory)/target'
+        flattenFolders: true
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish AIReadAPICore.jar'
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)/target'
+        artifactName: 'AIReadAPICore'
+
+  - job: BuildAIReadEE
+    pool:
+      vmImage: 'windows-2025'
+    steps:
+    - checkout: AIReadEE
+      lfs: true
+      persistCredentials: true
+    - task: Maven@4
+      displayName: 'Build AIReadEE`'
+      inputs:
+        mavenPomFile: 'AIReadEE/pom.xml'
+        mavenOptions: '-Xmx3072m'
+        javaHomeOption: 'JDKVersion'
+        jdkVersionOption: '1.21'
+        jdkArchitectureOption: 'x64'
+        mavenAuthenticateFeed: true # Azure Artifactsの認証突破のため
+        goals: 'package'
+    - task: PowerShell@2
+      displayName: 'Copy to staging directory and rename AIReadEE.jar'
+      inputs:
+        targetType: 'inline'
+        script: |
+          New-Item -ItemType Directory -Path "$(Build.ArtifactStagingDirectory)/target/" -Force
+          Copy-Item -Path "$(Build.SourcesDirectory)/AIReadEE/target/AIReadEE.jar" `
+              -Destination "$(Build.ArtifactStagingDirectory)/target/AIReadEE-latest.jar" `
+              -Force
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish renamed AIReadEE.jar'
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)/target'
+        artifactName: 'AIReadEE'
+
+- stage: WakeupVM
+  dependsOn: BuildAIRead
+  condition: Succeeded()
+  jobs:
+  - job: AllocateVM
+    pool:
+      vmImage: 'windows-2025'
+    steps:
+    - checkout: none
+    - task: AzureCLI@2
+      displayName: 'Start Self_hosted VM'
+      timeoutInMinutes: 30
+      inputs:
+        azureSubscription: 'Connection2AIReadWin2025'
+        scriptType: ps
+        scriptLocation: inlineScript
+        inlineScript: |
+            az vm start -n 'AIReadWin2025v7' -g 'AIReadWin2025'
+    - task: PowerShell@2
+      displayName: 'Wait for wakeup'
+      inputs:
+        targetType: 'inline'
+        script: Start-Sleep -Seconds 120
+
+- stage: AccuracyEvaluation
+  dependsOn: WakeupVM
+  condition: Succeeded()
+  jobs:
+  - deployment: AccuracyEvaluation
+    environment:
+      name: AutoRegressionTest
+      resourceType: VirtualMachine
+      tags: AIReadWin2025v7
+    timeoutInMinutes: 360 # タスクの最大実行時間
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+            clean: true
+            lfs: true
+            persistCredentials: true
+          # deploymentジョブでは仮想マシン上にArtifactsがすべて自動ダウンロードされるので、
+          # DownloadPipelineArtifact@2タスクは呼ばなくていい
+          - task: CopyFiles@2
+            displayName: 'put AIReadAPICore.jar on lib directory'
+            inputs:
+              SourceFolder: '$(Agent.BuildDirectory)/AIReadAPICore'
+              Contents: 'AIReadAPICore.jar'
+              TargetFolder: '$(AIREAD_HOME)/lib'
+              OverWrite: true
+          - task: CopyFiles@2
+            displayName: 'put AIReadEE-latest.jar on lib directory'
+            inputs:
+              SourceFolder: '$(Agent.BuildDirectory)/AIReadEE'
+              Contents: 'AIReadEE-latest.jar'
+              TargetFolder: '$(AIREAD_HOME)/lib'
+              OverWrite: true
+          - task: PowerShell@2
+            displayName: 'Copy and rename set_envs.bat'
+            inputs:
+              targetType: 'inline'
+              script: |
+                Copy-Item -Path "$env:AIREAD_HOME/scripts/set_envs.bat" `
+                    -Destination "$env:AIREAD_HOME/scripts/set_envs_backup.bat" `
+                    -Force
+          - task: PowerShell@2
+            displayName: 'Update set_envs.bat'
+            inputs:
+              targetType: 'inline'
+              script: |
+                $targetFile = "$env:AIREAD_HOME/scripts/set_envs.bat"
+                # ArtifactsからダウンロードしたEE、APICoreのjarでAIReadを実行するためにクラスパスを書き換え
+                if (Test-Path $targetFile) {
+                    Write-Host "Updating $targetFile..."
+                    (Get-Content $targetFile) | ForEach-Object {
+                        $_ -replace "AIReadEE.jar", "AIReadEE-latest.jar" `
+                          -replace "AIReadAPICore-[^;"" ]+\.jar", "AIReadAPICore.jar"
+                    } | Set-Content $targetFile -Encoding UTF8
+                    Write-Host "Update completed successfully."
+                } else {
+                    Write-Error "Target file not found: $targetFile"
+                }
+          - task: PowerShell@2
+            displayName: 'Clear .AIRead folder'
+            inputs:
+              targetType: 'inline'
+              script: |
+                Remove-Item -Path C:\Users\arise\.AIRead -Recurse -Force -ErrorAction Continue
+          - task: UsePythonVersion@0
+            displayName: 'Download Python 3.14'
+            inputs:
+              version: '3.14'
+          - task: PowerShell@2
+            displayName: 'Prepare Python virtual environment'
+            inputs:
+              targetType: 'inline'
+              script: |
+                # 仮想環境（.venv）の作成
+                python -m venv .venv
+
+                # 仮想環境内の Python / pip を直接指定して実行
+                & .venv/Scripts/python -m pip install --upgrade pip
+
+                # ソースコード依存ライブラリインストール
+                & .venv/Scripts/python -m pip install -r requirements.txt
+          - task: PythonScript@0
+            inputs:
+              scriptSource: 'filePath'
+              scriptPath: 'src/main.py'
+              arguments: '-c .azure-pipelines/config.toml'
+              workingDirectory: '$(Build.SourcesDirectory)'
+              pythonInterpreter: '$(Build.SourcesDirectory)/.venv/Scripts/python.exe'
+            env:
+                _JAVA_OPTIONS: '-Duser.home=C:\Users\arise' # pipelines > Python Script > Windows batch経由で実行されるJavaのUser Home Directoryが"C:\Windows\system32\config\systemprofile"になる仕様への対策
+                PYTHONPATH: '$(Build.SourcesDirectory)' # リポジトリルートをpythonのパッケージ探索パスリストに追加
+                PYTHONUTF8: '1' # 英語WindowsOS上で動くPython標準出力がcp1252であるために、Windows batch経由で実行されるAIReadの出力が文字化けすることへの対策
+          - task: CopyFiles@2
+            displayName: 'Copy evaluation results to staging directory'
+            inputs:
+              Contents: '$(Build.SourcesDirectory)/results/**'
+              TargetFolder: '$(Build.ArtifactStagingDirectory)/results'
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish evaluation results'
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)/results'
+              artifactName: 'evaluationResults'
+          - task: PowerShell@2
+            displayName: 'Clean up AIREAD_HOME environment'
+            condition: always()
+            inputs:
+              targetType: 'inline'
+              script: |
+                Remove-Item -Path "$env:AIREAD_HOME/lib/AIReadAPICore.jar", `
+                "$env:AIREAD_HOME/lib/AIReadEE-latest.jar" -Force -ErrorAction Continue
+                if (Test-Path "$env:AIREAD_HOME/scripts/set_envs_backup.bat") {
+                    Remove-Item -Path "$env:AIREAD_HOME/scripts/set_envs.bat" -Force -ErrorAction Continue
+                    Rename-Item -Path "$env:AIREAD_HOME/scripts/set_envs_backup.bat" -NewName "set_envs.bat"
+                }
+
+- stage: DeallocateVM
+  dependsOn: AccuracyEvaluation
+  condition: always()
+  pool:
+    vmImage: 'windows-2025'
+  jobs:
+  - job: DeallocateVM
+    steps:
+    - checkout: none
+    - task: AzureCLI@2
+      displayName: 'Deallocate Self_hosted VM'
+      timeoutInMinutes: 10
+      inputs:
+        azureSubscription: 'Connection2AIReadWin2025'
+        scriptType: ps
+        scriptLocation: inlineScript
+        inlineScript: |
+            az vm deallocate -n 'AIReadWin2025v7' -g 'AIReadWin2025'

@@ -1,0 +1,10 @@
+# AIReadAccuracyEvaluationTest - 本体の依存パッケージ
+
+# データ処理・分析
+pandas>=2.0.0
+
+# 文字列類似度計算 (Levenshtein距離)
+python-Levenshtein>=0.21.0
+
+# 文字エンコーディング検出
+chardet>=5.0.0

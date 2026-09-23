@@ -1,0 +1,3 @@
+regex	replace_char
+#共通#	#共通#
+\,00$	.00
