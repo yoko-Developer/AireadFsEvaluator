@@ -17,32 +17,59 @@ AIReadで読み取った決算書（Financial Statements）のOCR精度を自動
 ## ディレクトリ構成
 
 ```
+## ディレクトリ構成
+
+```text
 AireadFsEvaluator/
-├── src/                          # ソースコード
-│   ├── main.py                   # メインエントリーポイント
-│   ├── constants.py              # 定数定義
-│   ├── eval/                     # 評価モジュール
-│   │   └── csv4db_evaluator.py   # CSV比較のコアロジック
-│   └── utils/                    # ユーティリティ
-│       ├── path_utils.py         # パス操作
-│       └── cmd_executer.py       # コマンド実行
-├── tests/                        # テストコード
-│   ├── conftest.py               # pytestフィクスチャ
-│   ├── test_path_utils.py        # パスユーティリティのテスト
-│   ├── test_csv4db_evaluator.py  # 評価クラスのユニットテスト
-│   └── test_main.py              # mainモジュールのテスト
-├── data/                         # データディレクトリ
-│   ├── ground_truth/             # 正解データディレクトリ
-│   │   └── fs/                   # 正解データ
-│   └── row/                      # 生データ・AIRead一式
-│       ├── _tessdata/            # AIReadの頭脳データ
-│       ├── bspl/                 # AIRead設定
-│       ├── fal/                  # AIRead設定
-│       └── fs/                   # AIReadの決算書の出力先
-├── results/                      # 評価結果出力先
-├── pytest.ini                    # pytest設定
-├── requirements-test.txt         # テスト依存パッケージ
-└── README.md                     # このファイル
+│
+├── src/                                      # ソースコード
+│   ├── main.py                               # メインエントリーポイント
+│   ├── constants.py                          # 定数定義
+│   │
+│   ├── eval/                                 # 評価モジュール
+│   │   └── csv4db_evaluator.py               # CSV比較・評価のコアロジック
+│   │
+│   ├── gui/                                  # GUIモジュール
+│   │   ├── gui.py                            # GUI・ブラウザ起動
+│   │   └── pink_theme.json                   # UIテーマ設定
+│   │
+│   └── utils/                                # ユーティリティ
+│       ├── pathutils.py                      # パス操作
+│       └── cmd_executer.py                   # AIRead実行
+│
+├── tests/                                    # テストコード
+│   ├── conftest.py                           # pytest共通設定
+│   ├── test_pathutils.py                     # パス操作のテスト
+│   ├── test_csv4db_evaluator.py              # 評価処理のテスト
+│   └── test_main.py                          # mainのテスト
+│
+├── data/                                     # データディレクトリ
+│   ├── ground_truth/
+│   │   └── fs/                               # FS正解マスタ
+│   │
+│   └── row/                                  # AIRead実行環境・生データ
+│       ├── _tessdata/                        # OCR辞書・モデル
+│       └── fs/                               # FS用AIRead環境
+│           ├── input/                        # 評価対象PDF
+│           ├── output/                       # AIRead出力
+│           ├── debug/                        # デバッグ出力
+│           ├── failed/                       # 処理失敗ファイル
+│           ├── logs/                         # ログ
+│           ├── success/                      # 処理成功ファイル
+│           ├── AIRead_conf/                  # AIRead設定
+│           ├── AIRead_setting.ini            # AIRead設定ファイル
+│           └── run_assort.bat                # AIRead実行バッチ
+│
+├── results/                                  # 評価結果出力
+│   └── fs/                                   # FS評価結果
+│
+├── .azure-pipelines/
+│   └── config.toml                           # 実行設定
+│
+├── pytest.ini                                # pytest設定
+├── requirements-test.txt                     # テスト用依存パッケージ
+├── requirements.txt                          # 実行用依存パッケージ
+└── README.md                                 # プロジェクト説明                
 ```
 
 ## Getting Started
