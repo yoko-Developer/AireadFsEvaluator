@@ -1,154 +1,154 @@
 # AireadFsEvaluator
 
-AIReadで読み取った決算書（Financial Statements）のOCR精度を自動で評価するためのテストツールです。
-人間が作成した正解データ（Ground Truth）と、AIReadの出力結果（Prediction）を比較し、詳細な精度レポートを生成します。
+AIReadで読み取った財務諸表（Financial Statements）のOCR結果を、
+人間が作成した正解データ（Ground Truth）と比較して評価するためのツールです。
+
+AIReadの出力結果をそのまま評価対象とし、
+帳票・項目ごとの一致／不一致や、欠損・過剰などを確認できます。
 
 ## 概要
 
-このプロジェクトは、決算書（BS/PL等）読取機能の精度を自動的に評価するための独立したツールです。CSVファイルの比較により、項目精度、欠損・過剰の検出、差分レポートの生成を行います。
+本プロジェクトでは、決算書などの帳票をAIReadでOCR処理し、
+その結果と正解データを比較することでOCR精度を評価します。
+
+主な対象は以下です。
+
+- 貸借対照表
+- 損益計算書
+- 製造原価報告書
+- 販売費及び一般管理費明細書
+- 株主資本等変動計算書
+- キャッシュ・フロー計算書
+- 個別注記表
+- その他の対象帳票
+
+評価に使用するGround Truthは、PDFを確認して作成したマスタデータです。
 
 ## 主な機能
 
-- **CSV比較エンジン**: 正解データとAIRead出力結果の比較
-- **CSV行列のファジーマッチング**: 列・行の近似マッチングによる柔軟な比較
-- **詳細レポート**: HTML/CSV形式での視覚的な差分レポート
-- **サマリー統計**: 精度指標の集計とレポート生成
+- AIRead出力とGround TruthのCSV比較
+- 項目・行・列の比較
+- 一致／不一致の判定
+- 欠損・過剰データの確認
+- 評価結果の集計
+- 詳細な比較結果の出力
 
-## ディレクトリ構成
-
-```
 ## ディレクトリ構成
 
 ```text
 AireadFsEvaluator/
 │
-├── src/                                      # ソースコード
-│   ├── main.py                               # メインエントリーポイント
-│   ├── constants.py                          # 定数定義
-│   │
-│   ├── eval/                                 # 評価モジュール
-│   │   └── csv4db_evaluator.py               # CSV比較・評価のコアロジック
-│   │
-│   ├── gui/                                  # GUIモジュール
-│   │   ├── gui.py                            # GUI・ブラウザ起動
-│   │   └── pink_theme.json                   # UIテーマ設定
-│   │
-│   └── utils/                                # ユーティリティ
-│       ├── pathutils.py                      # パス操作
-│       └── cmd_executer.py                   # AIRead実行
+├── src/                       # アプリケーション本体
+│   ├── main.py
+│   ├── constants.py
+│   ├── eval/                  # 評価処理
+│   ├── gui/                   # GUI
+│   └── utils/                 # 共通処理
 │
-├── tests/                                    # テストコード
-│   ├── conftest.py                           # pytest共通設定
-│   ├── test_pathutils.py                     # パス操作のテスト
-│   ├── test_csv4db_evaluator.py              # 評価処理のテスト
-│   └── test_main.py                          # mainのテスト
+├── tests/                     # テストコード
 │
-├── data/                                     # データディレクトリ
+├── data/
 │   ├── ground_truth/
-│   │   └── fs/                               # FS正解マスタ
+│   │   └── fs/                # Ground Truth
 │   │
-│   └── row/                                  # AIRead実行環境・生データ
-│       ├── _tessdata/                        # OCR辞書・モデル
-│       └── fs/                               # FS用AIRead環境
-│           ├── input/                        # 評価対象PDF
-│           ├── output/                       # AIRead出力
-│           ├── debug/                        # デバッグ出力
-│           ├── failed/                       # 処理失敗ファイル
-│           ├── logs/                         # ログ
-│           ├── success/                      # 処理成功ファイル
-│           ├── AIRead_conf/                  # AIRead設定
-│           ├── AIRead_setting.ini            # AIRead設定ファイル
-│           └── run_assort.bat                # AIRead実行バッチ
+│   └── row/
+│       ├── fs/                # AIRead実行・予測データ
+│       │   ├── input/         # 入力PDF
+│       │   ├── output/        # AIRead出力
+│       │   ├── debug/         # デバッグ出力
+│       │   ├── failed/        # 処理失敗データ
+│       │   ├── logs/          # ログ
+│       │   ├── success/       # 処理成功データ
+│       │   └── AIRead_conf/   # AIRead設定
+│       │
+│       └── _tessdata/
+│           └── tessdata/      # OCRモデル・辞書等
 │
-├── results/                                  # 評価結果出力
-│   └── fs/                                   # FS評価結果
+├── results/
+│   └── fs/                    # 評価結果
 │
-├── .azure-pipelines/
-│   └── config.toml                           # 実行設定
-│
-├── pytest.ini                                # pytest設定
-├── requirements-test.txt                     # テスト用依存パッケージ
-├── requirements.txt                          # 実行用依存パッケージ
-└── README.md                                 # プロジェクト説明                
+├── .azure-pipelines/          # CI/CD設定
+├── pytest.ini                 # pytest設定
+├── requirements.txt           # 実行用依存パッケージ
+├── requirements-test.txt      # テスト用依存パッケージ
+└── README.md
 ```
 
-## Getting Started
+## Ground Truth と Prediction
+評価では、以下の2種類のデータを比較します。
 
-### 前提条件
+**Ground Truth**
 
-- Python 3.10以上
-- 仮想環境 (推奨)
+PDFを確認して作成した正解データです。
 
-### インストール
-
-1. リポジトリをクローン
-```bash
-git clone git@github.com:yoko-Developer/AireadFsEvaluator.git
-cd AireadFsEvaluator
+```
+data/ground_truth/fs/
 ```
 
-2. 依存パッケージのインストール
+**Prediction**
 
-```PowerShell
-pip install -r requirements.txt
-pip install -r requirements-test.txt
+AIReadを実行して取得したOCR結果です。
+
+```
+data/row/fs/
 ```
 
-3. 設定ファイル
-   
-config.toml に決算書（fs）専用のターゲットディレクトリを定義します。
+比較するため、Ground TruthとPredictionのファイル名を一致させます。
 
-```PowerShell
-[fs]
-prediction_dir = "./data/row/fs"
-ground_truth_dir = "./data/ground_truth/fs"
+## AIRead設定
+AIReadの実行に必要な設定は、以下に配置します。
+
 ```
+data/row/fs/AIRead_conf/
+```
+OCRモデル・辞書などは以下を使用します。
+```
+data/row/_tessdata/tessdata/
+```
+
+AIReadのバージョンアップ時には、
+AIRead本体だけでなく、設定ファイルやOCR関連ファイルについても
+必要な差分を確認します。
+
+## 評価対象の帳票
+現在の分類設定には、以下の帳票を含みます。
+
+
+| form_id | 帳票 |
+|---|---|
+| 01_010_02_01 | 貸借対照表 |
+| 01_020_02_01 | 損益計算書 |
+| 01_030_02_01 | 製造原価報告書 |
+| 01_040_02_01 | 販売費及び一般管理費 |
+| 01_050_02_01 | 株主資本等変動計算書 |
+| 01_060_02_01 | キャッシュ・フロー計算書 |
+| 01_070_02_01 | 個別注記表 |
+| 02_050_02_01 | 棚卸資産 内訳書 |
 
 ## 使用方法
-1. データの配置
-- AIReadの出力結果 (CSV) を ./data/row/fs/ に配置します。
-- 人間が作成した正解データ (CSV) を ./data/ground_truth/fs/ に配置します。
 
-    ※比較を行うため、双方のファイル名は完全に一致させてください。
-
-2. 評価の実行
-   
-   設定ファイルを指定し、セッションタイプを fs に指定して実行します。
-
-   ```PowerShell
+1. **データを配置**
+   - AIReadの出力結果：`data/row/fs/`
+   - Ground Truth：`data/ground_truth/fs/`
+   - 比較するファイル名を一致させる
+2. 評価を実行
+  ```bash
    python -m src.main -c config.toml -s fs
    ```
 
-3. 出力結果
+3. 結果を確認
+   - 評価結果：results/fs/
 
-実行後、results/fs/ ディレクトリに以下のレポートが自動生成されます。
-
+## テスト
+ユニットテストを実行します。
 ```
-results/
-└── fs/
-    ├── summary_report.csv                    # 決算書全体のサマリーレポート
-    └── individual reports/                   # 個別ファイルのレポート
-        ├── html/                             # HTML形式の視覚的差分レポート
-        │   └── diff_*.html
-        └── csv/                              # CSV形式の詳細レポート
-            └── */
-                ├── diff_list_*.csv           # 項目ごとの差分リスト
-                └── full_comparison_*.csv     # 全データ比較
-```
-
-## Build and Test
-
-### UT(ユニットテスト) の実行
-
-```PowerShell
-# 全テストを一括実行
 pytest tests -v
+```
 
-# カバレッジレポートの生成
+カバレッジを取得する場合：
+```
 pytest tests --cov=src --cov-report=html
 ```
 
-## 開発規約
-- コードスタイル: PEP 8準拠、SpringBootライクな厳格なクラス設計と型ヒントの徹底。
-
-- ブランチ戦略: 機能追加は feature/ ブランチで行い、自動テスト（CI/CD）の通過を確認後に main へマージ。
+## 開発
+機能追加・修正はブランチを分けて行い、動作確認・テスト後にマージします。
