@@ -1,4 +1,4 @@
-﻿@echo off
+@echo off
 chcp 65001
 call "%AIREAD_HOME%\scripts\set_envs.bat"
 set MAIN_CLASS_NAME=co.jp.ariseinnovation.AIReadEE.AIReadEE
