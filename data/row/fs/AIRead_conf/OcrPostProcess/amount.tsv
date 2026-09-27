@@ -1,0 +1,6 @@
+regex	replace_char
+\\n	
+円	
+△	-
+▲	-
+O	0
