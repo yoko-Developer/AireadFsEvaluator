@@ -1,0 +1,8 @@
+regex	replace_char
+[UuOoCc(¢@]	0
+\][Il]|[lIi\]」!\|:;]	1
+[Zz]	2
+fi|[fbEG]	6
+[SsB]	8
+[gq]	9
+[^0-9]	

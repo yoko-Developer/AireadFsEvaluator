@@ -88,6 +88,11 @@ class Csv4dbEvaluator:
             if gt_df is None or pd_df is None:
                 continue
 
+            # 決算書評価では、ヘッダー・「○○の部」などは評価対象外。
+            # Ground Truth と Prediction の両方から評価対象外行を除外する。
+            gt_df = self._exclude_non_evaluation_rows(gt_df)
+            pd_df = self._exclude_non_evaluation_rows(pd_df)
+            
             # 正解データと対象データの比較すべき行列ペアを特定
             gt_df, pd_df = self._align_columns_by_fuzzy_match(gt_df, pd_df)
             gt_df, pd_df = self._align_rows_by_fuzzy_match(gt_df, pd_df)
@@ -195,10 +200,9 @@ class Csv4dbEvaluator:
         pd_df.columns = pandas.Index(pd_col_new_names)
         # ------------------------------------------------------------------------
 
-        # 元のヘッダーをデータの-1行目として挿入（レポートでの表示用）
-        self._insert_headers_as_data_row(gt_df, gt_orig_cols)
-        self._insert_headers_as_data_row(pd_df, pd_orig_cols)
-
+        # ヘッダーは評価対象外。
+        # 以前はヘッダーをデータ行として追加していたため、
+        # 「account / 科目 / 金額」などが評価項目に混入していた。
         return gt_df, pd_df
 
 
@@ -275,6 +279,83 @@ class Csv4dbEvaluator:
         df.index = df.index + 1
         df.sort_index(inplace=True)
 
+
+    # ==========================================
+    # 決算書評価対象外行の除外
+    # ==========================================
+    @classmethod
+    def _exclude_non_evaluation_rows(cls, df: pandas.DataFrame) -> pandas.DataFrame:
+        """
+        AIRead側に残る「評価対象外」の行を評価前に除外する。
+
+        除外対象:
+        - ヘッダー行（account / 科目 / 金額 など）
+        - 「資産の部」「負債の部」などの「○○の部」
+        - "(流動資産)" のような括弧だけの区分見出し
+
+        ※ 正解マスタ側は変更しない。
+        ※ 金額のカンマ・ピリオド等はここでは正規化しない。
+          それらはAIReadの生の結果として比較する。
+        """
+        if df.empty:
+            return df
+
+        account_col = cls._find_column(
+            df.columns,
+            ["account", "科目", "勘定科目", "item", "item_name"]
+        )
+
+        if account_col is None:
+            # account列を特定できない場合は、従来の比較処理をそのまま使う。
+            return df.reset_index(drop=True)
+
+        mask = pandas.Series(True, index=df.index)
+
+        for idx, value in df[account_col].fillna("").items():
+            account = str(value).strip()
+            normalized = cls._normalize_text(account)
+
+            # ヘッダー
+            if normalized in {"account", "科目", "勘定科目", "item", "itemname"}:
+                mask.loc[idx] = False
+                continue
+
+            # 「資産の部」「負債の部」「純資産の部」など
+            if account.endswith("の部"):
+                mask.loc[idx] = False
+                continue
+
+            # "(流動資産)" "(固定資産)" のような区分見出し
+            if cls._is_parenthesized_heading(account):
+                mask.loc[idx] = False
+
+        return df.loc[mask].reset_index(drop=True)
+
+    @staticmethod
+    def _find_column(columns, candidates: List[str]) -> Optional[str]:
+        normalized = {
+            str(col).strip().lower(): str(col)
+            for col in columns
+        }
+        for candidate in candidates:
+            found = normalized.get(candidate.lower())
+            if found is not None:
+                return found
+        return None
+
+    @staticmethod
+    def _is_parenthesized_heading(value: str) -> bool:
+        value = value.strip()
+        if len(value) < 3:
+            return False
+        pairs = [
+            ("(", ")"),
+            ("（", "）"),
+            ("【", "】"),
+            ("[", "]"),
+        ]
+        return any(value.startswith(left) and value.endswith(right)
+                   for left, right in pairs)
 
     # ==========================================
     # 行の紐付け (Row Alignment)
@@ -608,8 +689,19 @@ class Csv4dbEvaluator:
     # ==========================================
     @staticmethod
     def _normalize_text(text: str) -> str:
-        """比較のノイズとなる記号を除去"""
-        return re.sub(r'[【】\(\)（）※\*＊,、\s\t]', '', str(text))
+        """
+        行・列の位置合わせ用の文字列正規化。
+
+        注意:
+        - 金額のカンマやピリオドを「正解扱い」にする正規化ではない。
+        - 実際の一致判定は _calc_data_accuracy_by_row で元値を比較する。
+        """
+        value = str(text)
+
+        # 科目名の先頭に付く連番（例: "1 現金", "01.現金"）は評価対象外。
+        value = re.sub(r'^\s*\d+[\.．、,\s:：\-－]*', '', value)
+
+        return re.sub(r'[【】\(\)（）※\*＊,、\s\t]', '', value)
 
 
     @staticmethod
