@@ -9,3 +9,4 @@ python-Levenshtein>=0.21.0
 # 文字エンコーディング検出
 chardet>=5.0.0
 customtkinter
+openpyxl>=3.1.5
