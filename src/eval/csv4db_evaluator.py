@@ -1,23 +1,35 @@
 # standard library
 import logging
+import json
 import re
 import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import cast, List, Tuple, Dict, Optional
+from collections import Counter
+from src.eval.logical_formids import logical_gt_formids
 # third-party
 import Levenshtein
 import pandas
 # local
 from src import constants as const
 from src.utils import fileutils 
-
+from src.eval.excel_exporter import KessanExcelExporter
 
 class Csv4dbEvaluator:
     """
-    CSV4DB形式で出力したAIReadの結果ファイルと正解データファイル(Ground Truth)を比較し、
-    精度指標の算出および差分レポート(CSV/HTML)を出力するクラス。
+    CSV4DB形式で出力したAIReadResultファイルと正解データファイル(Ground Truth)を比較し、
+    精度指標の算出および差分レポート(CSV/HTML/Excel)を出力するクラス
     """
+
+    # ★formidから帳票タイトルへのマッピング定数★
+    FORM_ID_MAP = {
+        "01_010_02": "貸借対照表 (BS)",
+        "01_020_02": "損益計算書 (PL)",
+        "01_030_02": "製造原価報告書",
+        "01_040_02": "販売費及び一般管理費明細書",
+        "01_050_02": "株主資本等変動計算書"
+    }
 
     def __init__(self, session: str, prediction_dir: Path, ground_truth_dir: Path, results_base_dir: Path) -> None:
         self.session: str = session
@@ -67,11 +79,11 @@ class Csv4dbEvaluator:
         # prediction files（比較対象ファイル）
         pd_files = [f for f in sorted(self.predictions_dir.iterdir()) if f.is_file() and f.suffix == '.csv']
         num_of_file = len(pd_files)
-
+        
         # 統計集計用に (ファイル名, 統合データフレーム) のリストを保持
         evaluation_results: List[Tuple[str, pandas.DataFrame]] = []
 
-        logging.info(f"🚀 {num_of_file} 件の精度解析を開始します...")
+        logging.info(f"🚀 {num_of_file} 件の精度解析を開始")
         logging.info(f"📁 出力先セッション: {self.session_dir}")
 
         for i, pd_file in enumerate(pd_files, start=1):
@@ -83,33 +95,171 @@ class Csv4dbEvaluator:
                 logging.warning(f"[{i}/{num_of_file}] ⚠️  スキップ: {pd_file.name} (正解データが ground_truth フォルダに存在しません)")
                 continue
 
-            # CSVデータ読込
-            gt_df, pd_df = self._load_csv_to_dataframe(gt_file, pd_file)
-            if gt_df is None or pd_df is None:
-                continue
+            # CSVデータ読込。
+            # 複数帳票ページのdetailは、物理ページへ連結したCSVではなく、
+            # そのGT detailが属する論理帳票のregion CSVだけを使う。
+            # 分類はsidecarの全regionを使うため、ここで他帳票を捨てても分類5/5には影響しない。
+            pd_load_file = pd_file
+            ocr_scored_formids = []
+            ocr_unscored_formids = []
+            if "_detail" in pd_file.name:
+                m = re.match(r'(.+)_([0-9]+)_detail\.csv$', pd_file.name)
+                sidecar_path = self.predictions_dir / '.logical_region_formids.json'
+                if m and sidecar_path.exists():
+                    orig_name, page_index_text = m.group(1), m.group(2)
+                    page_index = int(page_index_text)
+                    gt_class_file = self.ground_truth_dir / f'{orig_name}_{page_index}.csv'
+                    try:
+                        sidecar = json.loads(sidecar_path.read_text(encoding='utf-8'))
+                        base_gt_ids = []
+                        if gt_class_file.exists():
+                            gt_class_df = pandas.read_csv(gt_class_file, dtype=str, keep_default_na=False)
+                            if 'formid' in gt_class_df.columns:
+                                base_gt_ids = [str(x).strip() for x in gt_class_df['formid'].tolist() if str(x).strip()]
 
-            # 決算書評価では、ヘッダー・「○○の部」などは評価対象外。
-            # Ground Truth と Prediction の両方から評価対象外行を除外する。
-            gt_df = self._exclude_non_evaluation_rows(gt_df)
-            pd_df = self._exclude_non_evaluation_rows(pd_df)
-            
-            # 正解データと対象データの比較すべき行列ペアを特定
-            gt_df, pd_df = self._align_columns_by_fuzzy_match(gt_df, pd_df)
-            gt_df, pd_df = self._align_rows_by_fuzzy_match(gt_df, pd_df)
-            # 正解データと対象データをマージ
-            merged_df = pandas.merge(gt_df, pd_df, on='row_id', how='outer', indicator='row_presence', validate="many_to_many").fillna('')
-            # --- マージ後は行順が辞書順になってしまうので、行順を[r1, r2,..., r10, r11,...]のように自然にするために並び替え ---
-            # 1. 数字部分だけを抽出して数値(int)にする（r2 や extra_r2 から "2" を取り出す）
-            merged_df['r_num'] = merged_df['row_id'].str.extract(r'(\d+)').astype(int)
-            # 2. 'extra' から始まるかどうかを判定する (False=0, True=1 になるので、r が先に来る)
-            merged_df['r_has_extra'] = merged_df['row_id'].str.startswith('extra').astype(int)
-            # 3. 「数字」→「extraかどうか」の順でソート
-            merged_df = merged_df.sort_values(by=['r_num', 'r_has_extra'])
-            # 4. 作業用カラムを削除してインデックスを振り直す
-            merged_df = merged_df.drop(columns=['r_num', 'r_has_extra']).reset_index(drop=True)
+                        region_items = sidecar.get(orig_name, {}).get(str(page_index), [])
+                        # GT分類CSVが表す帳票と同じformidのregionを「全部」使う。
+                        # P1のBSは左右2領域で1つのGT明細を構成するため、1件目だけ選ぶと
+                        # 右半分/左半分のどちらかしか採点できない。重複を保持したままregion順に連結する。
+                        matching_items = [
+                            x for x in region_items
+                            if str(x.get('formid', '')).strip() in base_gt_ids and x.get('detail_file')
+                        ]
+                        matching_items.sort(key=lambda x: int(x.get('region', 0) or 0))
+                        ocr_scored_formids = [str(x.get('formid', '')).strip() for x in matching_items]
+                        ocr_unscored_formids = [
+                            str(x.get('formid', '')).strip() for x in region_items
+                            if str(x.get('formid', '')).strip() in self.FORM_ID_MAP
+                            and str(x.get('formid', '')).strip() not in base_gt_ids
+                        ]
 
-            # 精度計算
-            merged_df[['item_count', 'match_count', 'accuracy']] = merged_df.apply(self._calc_data_accuracy_by_row, axis=1)
+                        candidates = []
+                        for item in matching_items:
+                            candidate = self.predictions_dir / '.logical_region_details' / str(item['detail_file'])
+                            if candidate.exists():
+                                candidates.append((item, candidate))
+
+                        if len(candidates) == 1:
+                            pd_load_file = candidates[0][1]
+                            logging.info('  🧩 P%d OCR detail region選択: GT=%s -> R%s (%s)',
+                                         page_index + 1, '/'.join(base_gt_ids), candidates[0][0].get('region'), candidates[0][1].name)
+                        elif len(candidates) > 1:
+                            # region CSVを元の物理順で連結。GTや値を見て「正解率が高い方」を選ばない。
+                            temp_dir = self.session_dir / '.logical_ocr_inputs'
+                            temp_dir.mkdir(parents=True, exist_ok=True)
+                            combined_path = temp_dir / pd_file.name
+                            frames = [pandas.read_csv(path, dtype=str, keep_default_na=False) for _, path in candidates]
+                            pandas.concat(frames, ignore_index=True, sort=False).fillna('').to_csv(
+                                combined_path, index=False, encoding='utf-8-sig'
+                            )
+                            pd_load_file = combined_path
+                            logging.info('  🧩 P%d OCR detail region結合: GT=%s -> %s',
+                                         page_index + 1, '/'.join(base_gt_ids),
+                                         [f"R{x.get('region')}" for x, _ in candidates])
+                    except Exception as e:
+                        logging.warning('⚠ logical region detail選択に失敗。物理ページdetailへフォールバック: %s', e)
+
+            # formid列を持つdetail GTは、帳票ごとに独立して比較する。
+            # 例: P2のPL(amount_0/1)と製造原価(amount_0/1/2)を先に連結すると、
+            # PLの「当期」列が製造原価側のamount_0へ誤対応して値が空になるため。
+            grouped_merged = None
+            if "_detail" in pd_file.name:
+                m_group = re.match(r'(.+)_([0-9]+)_detail\.csv$', pd_file.name)
+                sidecar_path_group = self.predictions_dir / '.logical_region_formids.json'
+                if m_group and sidecar_path_group.exists():
+                    try:
+                        gt_probe = pandas.read_csv(gt_file, dtype=str, keep_default_na=False, nrows=2)
+                        if 'formid' in gt_probe.columns:
+                            orig_group, page_group_text = m_group.group(1), m_group.group(2)
+                            sidecar_group = json.loads(sidecar_path_group.read_text(encoding='utf-8'))
+                            region_group = sidecar_group.get(orig_group, {}).get(str(int(page_group_text)), [])
+                            grouped_merged, ocr_scored_formids, ocr_unscored_formids = self._compare_detail_by_formid(
+                                gt_file, orig_group, int(page_group_text), region_group
+                            )
+                    except Exception as e:
+                        logging.warning('⚠ 帳票別OCR比較に失敗。従来比較へフォールバック: %s', e)
+
+            # P3のGT detailには formid 列が無い旧マスタもある。
+            # その場合 _compare_detail_by_formid() には入らないため、従来比較ルート側でも
+            # 01_050_02 を検出して横持ち -> 25行縦持ちへ変換する。
+            p3_position_mode = False
+            if grouped_merged is None and "_detail" in pd_file.name and "01_050_02" in base_gt_ids:
+                try:
+                    raw_p3 = pandas.read_csv(pd_load_file, dtype=str, keep_default_na=False)
+                    normalized_p3 = self._normalize_equity_matrix_detail(raw_p3)
+                    if normalized_p3 is not None and not normalized_p3.empty and list(normalized_p3.columns) == ["account", "amount_0"]:
+                        temp_dir = self.session_dir / '.logical_ocr_inputs'
+                        temp_dir.mkdir(parents=True, exist_ok=True)
+                        p3_path = temp_dir / f"{pd_file.stem}_P3_vertical.csv"
+                        normalized_p3.to_csv(p3_path, index=False, encoding='utf-8-sig')
+                        pd_load_file = p3_path
+                        p3_position_mode = True
+                        logging.info("  ↕ P%d P3旧GTルート: 横持ち -> 25行縦持ちへ変換", page_index + 1)
+                except Exception as e:
+                    logging.warning("⚠ P3旧GTルートの縦持ち変換に失敗: %s", e)
+
+            if grouped_merged is None:
+                gt_df, pd_df = self._load_csv_to_dataframe(gt_file, pd_load_file)
+                if gt_df is None or pd_df is None:
+                    continue
+            else:
+                gt_df = pd_df = None
+
+            # ★分類CSVは、fuzzy alignment前の生formidを全件退避する。
+            # GTが1行、Predictionが複数行でも2件目以降を落とさない。
+            raw_gt_formids = []
+            raw_pd_formids = []
+            if "_detail" not in pd_file.name:
+                if "formid" in gt_df.columns:
+                    raw_gt_formids = [str(v).strip() for v in gt_df["formid"].tolist()
+                                      if str(v).strip() and str(v).strip().lower() != "nan"]
+                if "formid" in pd_df.columns:
+                    raw_pd_formids = [str(v).strip() for v in pd_df["formid"].tolist()
+                                      if str(v).strip() and str(v).strip().lower() != "nan"]
+
+            if grouped_merged is None:
+                # 正解データと対象データの比較すべき行列ペアを特定
+                # P3旧GTは先頭に「株主資本」という階層見出しを1行持つが、
+                # AIRead横持ち表には対応するセルがない。これはOCR評価項目ではなく
+                # 構造見出しなので、P3の位置比較時だけ除外する。
+                if p3_position_mode and len(gt_df) == len(pd_df) + 1 and not gt_df.empty:
+                    first_gt = str(gt_df.iloc[0, 0]).strip()
+                    if first_gt == "株主資本":
+                        gt_df = gt_df.iloc[1:].reset_index(drop=True)
+                        logging.info("  ↕ P%d P3旧GTルート: 先頭構造見出し『株主資本』をOCR採点から除外", page_index + 1)
+
+                gt_df, pd_df = self._align_columns_by_fuzzy_match(gt_df, pd_df)
+                if p3_position_mode:
+                    # P3は既にGTと同じ25行位置へ展開済み。誤読された行名でfuzzy再配置しない。
+                    gt_df = gt_df.reset_index(drop=True)
+                    pd_df = pd_df.reset_index(drop=True)
+                    gt_df['row_id'] = [f"r{i}" for i in range(len(gt_df))]
+                    pd_df['row_id'] = [f"r{i}" for i in range(len(pd_df))]
+                    logging.info("  ↕ P%d P3旧GTルート: 25行の論理位置で直接比較", page_index + 1)
+                else:
+                    gt_df, pd_df = self._align_rows_by_fuzzy_match(gt_df, pd_df)
+                # 正解データと対象データをマージ
+                merged_df = pandas.merge(gt_df, pd_df, on='row_id', how='outer', indicator='row_presence', validate="many_to_many").fillna('')
+
+                # --- マージ後は行順が辞書順になってしまうので自然順に並び替え ---
+                merged_df['r_num'] = merged_df['row_id'].str.extract(r'(\d+)').astype(int)
+                merged_df['r_has_extra'] = merged_df['row_id'].str.startswith('extra').astype(int)
+                merged_df = merged_df.sort_values(by=['r_num', 'r_has_extra'])
+                merged_df = merged_df.drop(columns=['r_num', 'r_has_extra']).reset_index(drop=True)
+
+                # 精度計算
+                merged_df[['item_count', 'match_count', 'accuracy']] = merged_df.apply(self._calc_data_accuracy_by_row, axis=1)
+            else:
+                merged_df = grouped_merged
+
+            if "_detail" in pd_file.name:
+                merged_df.attrs["ocr_scored_formids"] = list(ocr_scored_formids)
+                merged_df.attrs["ocr_unscored_formids"] = list(ocr_unscored_formids)
+
+            # 分類判定はmerge後の列ではなく、AIRead生CSVの全formidを使う。
+            if "_detail" not in pd_file.name:
+                merged_df.attrs["raw_gt_formids"] = raw_gt_formids
+                merged_df.attrs["raw_pd_formids"] = raw_pd_formids
 
             # ファイル別レポート出力
             diff_df = self._extract_differences(merged_df)
@@ -121,115 +271,595 @@ class Csv4dbEvaluator:
         # サマリーレポートの生成
         if evaluation_results:
             self._save_summary_report(evaluation_results)
-        else:
-            logging.warning("❌ 評価対象データが見つかりませんでした。")
 
+            try:
+                base_excel_path = self.session_dir / "kessan_matrix_report.xlsx"
+                excel_output_path = base_excel_path
+                counter = 1
+                while True:
+                    try:
+                        if excel_output_path.exists():
+                            with open(excel_output_path, "a"): pass
+                        break
+                    except IOError:
+                        excel_output_path = self.session_dir / f"kessan_matrix_report_{counter}.xlsx"
+                        counter += 1
+
+                pdf_groups = {}
+                for file_name, df in evaluation_results:
+                    base_pdf_name = re.sub(r'_\d+(_detail)?\.csv$', '', file_name)
+                    if base_pdf_name not in pdf_groups:
+                        pdf_groups[base_pdf_name] = []
+                    pdf_groups[base_pdf_name].append((file_name, df))
+
+                summary_list = []
+                detail_dfs = []
+                classification_details = []
+
+                # Split-region classifications are captured before physical-page consolidation.
+                # This is the source of truth for classification when present.
+                logical_sidecar = {}
+                sidecar_path = self.predictions_dir / ".logical_region_formids.json"
+                if sidecar_path.exists():
+                    try:
+                        logical_sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+                        logging.info("🧩 分割帳票formidをsidecarから評価します: %s", sidecar_path)
+                    except Exception as e:
+                        logging.warning("⚠ logical formid sidecarを読めません: %s", e)
+
+                for pdf_name, page_list in pdf_groups.items():
+                    total_pages = 0
+                    total_items = 0
+                    total_matches = 0
+                    page_df_list = []
+                    detail_page_keys = set()
+
+                    classification_total = 0
+                    classification_matches = 0
+                    
+                    # ページごとの帳票タイトルを分類CSVから取得
+                    page_title_map = {}
+                    classification_ok_map = {}
+                    logical_formids_map = {}
+
+                    for page_file_name, df in page_list:
+                        if "_detail" not in page_file_name:
+                            page_key = page_file_name.replace(".csv", "")
+
+                            gt_ids = list(df.attrs.get("raw_gt_formids", []))
+                            raw_pd_ids = list(df.attrs.get("raw_pd_formids", []))
+                            pd_ids = [x for x in raw_pd_ids if x in self.FORM_ID_MAP]
+
+                            # Prefer the pre-consolidation region list.  pdf_name is the original PDF stem.
+                            page_match = re.search(r'_(\d+)\.csv$', page_file_name)
+                            page_index = int(page_match.group(1)) if page_match else -1
+                            region_items = logical_sidecar.get(pdf_name, {}).get(str(page_index), [])
+                            if region_items:
+                                sidecar_ids = [str(x.get("formid", "")).strip() for x in region_items]
+                                pd_ids = [x for x in sidecar_ids if x in self.FORM_ID_MAP]
+                                raw_pd_ids = sidecar_ids
+                                logging.info("  🧩 P%d region formid(source): %s", page_index + 1, sidecar_ids)
+
+                            # Prefer the pre-consolidation region list.  pdf_name is the original PDF stem.
+                            page_match = re.search(r'_(\d+)\.csv$', page_file_name)
+                            page_index = int(page_match.group(1)) if page_match else -1
+                            region_items = logical_sidecar.get(pdf_name, {}).get(str(page_index), [])
+                            if region_items:
+                                sidecar_ids = [str(x.get("formid", "")).strip() for x in region_items]
+                                pd_ids = [x for x in sidecar_ids if x in self.FORM_ID_MAP]
+                                raw_pd_ids = sidecar_ids
+                                logging.info("  🧩 P%d region formid(source): %s", page_index + 1, sidecar_ids)
+                            if not gt_ids and not raw_pd_ids:
+                                for _, row in df.iterrows():
+                                    gt_formid = str(row.get("c1_gt", "") or "").strip()
+                                    pd_formid = str(row.get("c1_pd", "") or "").strip()
+                                    if gt_formid and gt_formid != "formid":
+                                        gt_ids.append(gt_formid)
+                                    if pd_formid and pd_formid != "formid" and pd_formid in self.FORM_ID_MAP:
+                                        pd_ids.append(pd_formid)
+
+                            page_match = re.search(r'_(\d+)\.csv$', page_file_name)
+                            page_no = int(page_match.group(1)) + 1 if page_match else 0
+                            gt_ids = logical_gt_formids(pdf_name, page_no, gt_ids)
+                            logical_formids_map[page_key] = list(gt_ids)
+
+                            if gt_ids:
+                                # OCR明細は物理ページ単位なので、表示タイトルは複数帳票を連結する。
+                                titles = [self.FORM_ID_MAP.get(fid, fid) for fid in gt_ids]
+                                title_counts = Counter(titles)
+                                shown = []
+                                for title in dict.fromkeys(titles):
+                                    n = title_counts[title]
+                                    shown.append(f"{title} × {n}" if n > 1 else title)
+                                page_title_map[page_key] = " ＋ ".join(shown)
+                                # 複数帳票ページでは完全一致でなくても、AIRead分類がGTの
+                                # 論理帳票と1件以上一致すれば、そのdetail CSVをOCR採点する。
+                                gt_counter = Counter(gt_ids)
+                                pd_counter = Counter(pd_ids)
+                                classification_ok_map[page_key] = sum((gt_counter & pd_counter).values()) > 0
+                    
+                    form_totals = {
+                        "貸借対照表 (BS)": [0, 0],
+                        "損益計算書 (PL)": [0, 0],
+                        "製造原価報告書": [0, 0],
+                        "販売費及び一般管理費明細書": [0, 0],
+                        "株主資本等変動計算書": [0, 0],
+                    }
+
+                    # ★直前の検出タイトルを記憶する変数★
+                    last_detected_title = None
+
+                    for page_file_name, df in page_list:
+
+                        # 分類データ（_detail ではない通常CSV）
+                        if "_detail" not in page_file_name:
+                            # 1物理ページに複数帳票がある場合を落とさない。
+                            # 重複帳票（例: BS×2）も意味があるため set にはしない。
+                            gt_formids: List[str] = list(df.attrs.get("raw_gt_formids", []))
+                            raw_pd_formids = list(df.attrs.get("raw_pd_formids", []))
+                            pd_formids: List[str] = [x for x in raw_pd_formids if x in self.FORM_ID_MAP]
+
+                            # 分類集計も、物理ページへ統合する前の region formid を正として使う。
+                            # ここが実際に classification_matches を加算する経路。
+                            page_match = re.search(r'_(\d+)\.csv$', page_file_name)
+                            page_index = int(page_match.group(1)) if page_match else -1
+                            region_items = logical_sidecar.get(pdf_name, {}).get(str(page_index), [])
+                            if region_items:
+                                sidecar_ids = [str(x.get("formid", "")).strip() for x in region_items]
+                                raw_pd_formids = sidecar_ids
+                                pd_formids = [x for x in sidecar_ids if x in self.FORM_ID_MAP]
+                                logging.info("  🧩 P%d 分類集計 region formid: %s", page_index + 1, sidecar_ids)
+
+                            if not gt_formids and not raw_pd_formids:
+                                for _, row in df.iterrows():
+                                    gt = str(row.get("c1_gt", "") or "").strip()
+                                    pd = str(row.get("c1_pd", "") or "").strip()
+                                    if gt and gt != "formid":
+                                        gt_formids.append(gt)
+                                    if pd and pd != "formid" and pd in self.FORM_ID_MAP:
+                                        pd_formids.append(pd)
+
+                            # GUI/Markdownと同じ分類対象判定に統一する。
+                            # 表紙など GT formid が空/unknown/none/不明 のページは評価対象外。
+                            # それ以外はFORM_ID_MAP未登録でも分類対象に残す。
+                            gt_formids = [x for x in gt_formids if x.lower() not in {"unknown", "none", "不明"}]
+                            is_classification_target = bool(gt_formids)
+
+                            # 分類結果詳細用に、評価対象外ページも含めて1ページ1行で保持する。
+                            page_match = re.search(r'_(\d+)\.csv$', page_file_name)
+                            page_no = int(page_match.group(1)) + 1 if page_match else ""
+                            if page_no:
+                                gt_formids = logical_gt_formids(pdf_name, page_no, gt_formids)
+                            logging.info("  🔎 P%s GT formid: %s", page_no, gt_formids or ["なし"])
+                            logging.info("  🔎 P%s AIRead formid(決算5表): %s", page_no, pd_formids or ["なし"])
+                            gt_counter = Counter(gt_formids)
+                            pd_counter = Counter(pd_formids)
+                            page_total_forms = sum(gt_counter.values())
+                            page_match_forms = sum((gt_counter & pd_counter).values())
+                            gt_title = (
+                                " ＋ ".join(self.FORM_ID_MAP.get(x, x) for x in gt_formids)
+                                if is_classification_target else "評価対象外"
+                            )
+                            pd_title = (
+                                " ＋ ".join(self.FORM_ID_MAP.get(x, x) for x in pd_formids)
+                                if pd_formids else "不明"
+                            )
+                            classification_details.append({
+                                "filename": pdf_name, "page": page_no,
+                                "gt_title": gt_title, "pd_title": pd_title,
+                                "gt_formid": " / ".join(gt_formids),
+                                "pd_formid": " / ".join(pd_formids),
+                                "gt_formids": gt_formids, "pd_formids": pd_formids,
+                                "is_target": is_classification_target,
+                                "is_match": is_classification_target and gt_counter == pd_counter,
+                                "classification_total": page_total_forms,
+                                "classification_matches": page_match_forms,
+                            })
+
+                            if is_classification_target:
+                                total_pages += 1
+                                classification_total += page_total_forms
+                                classification_matches += page_match_forms
+
+                            continue
+
+                        # 明細データ(_detail)
+                        page_key = page_file_name.replace("_detail.csv", "")
+                        detail_page_keys.add(page_key)
+
+                        item_sum = (
+                            df["item_count"].sum()
+                            if "item_count" in df.columns
+                            else len(df)
+                        )
+                        match_sum = (
+                            df["match_count"].sum()
+                            if "match_count" in df.columns
+                            else 0
+                        )
+
+                        # 分類〇のページだけOCR集計に入れる
+                        is_classification_ok = classification_ok_map.get(page_key, True)
+
+                        if is_classification_ok:
+                            total_items += item_sum
+                            total_matches += match_sum
+                        else:
+                            # Excel表示用に「分類不一致」を記録
+                            df.attrs["classification_mismatch"] = True
+
+                        # Excel詳細の水色サブヘッダは、実際にOCR採点したregionだけで区切る。
+                        # 分類上の全帳票は別属性に保持し、GT明細が無い帳票は「評価対象外」と表示する。
+                        all_logical_ids = list(logical_formids_map.get(page_key, []))
+                        df.attrs["all_logical_gt_formids"] = all_logical_ids
+                        scored_ids = list(df.attrs.get("ocr_scored_formids", []) or [])
+                        df.attrs["logical_gt_formids"] = scored_ids or all_logical_ids
+
+                        # GTの分類CSVから帳票タイトルを取得
+                        detected_title = page_title_map.get(page_key)
+
+                        # 念のためdetail内のformidも確認
+                        if not detected_title:
+                            detected_title = self._detect_title_by_formid(df)
+
+                        if not detected_title:
+                            # FORM_ID_MAPに未登録でも、分類対象かつdetailがあるページは
+                            # Excel詳細から消さない。GUI/Markdownと同じ汎用タイトルにする。
+                            detected_title = "決算書帳票"
+
+                        if detected_title in form_totals:
+                            # 決算5表として判定できたページだけ帳票別OCR精度へ集計
+                            if is_classification_ok:
+                                form_totals[detected_title][0] += match_sum
+                                form_totals[detected_title][1] += item_sum
+
+                        # 詳細Excelでは物理ページ番号を失わない。
+                        # page_df_list の並び順をページ番号として扱うと、detail欠落ページがある時に
+                        # 後続ページが前へ詰まり（例: P3がP2表示）、SummaryとExcelがずれる。
+                        page_match = re.search(r'_(\d+)_detail\.csv$', page_file_name)
+                        physical_page_no = int(page_match.group(1)) + 1 if page_match else 0
+                        df.attrs["physical_page_no"] = physical_page_no
+                        page_df_list.append((detected_title, df))
+
+                    # 分類CSVは存在するがdetail CSVが存在しないページをExcel表示用に残す
+                    for page_key, page_title in page_title_map.items():
+                        if page_key not in detail_page_keys:
+                            missing_df = pandas.DataFrame()
+                            missing_df.attrs["missing_detail"] = True
+                            page_match = re.search(r'_(\d+)$', page_key)
+                            physical_page_no = int(page_match.group(1)) + 1 if page_match else 0
+                            missing_df.attrs["physical_page_no"] = physical_page_no
+                            page_df_list.append((page_title, missing_df))
+
+                    # detail有無に関係なく、必ず元PDFの物理ページ順に戻す。
+                    page_df_list.sort(key=lambda item: int(item[1].attrs.get("physical_page_no", 10**9)))
+                            
+                    def form_acc(title):
+                        matches, items = form_totals[title]
+                        return round(matches / items * 100, 1) if items > 0 else "-"
+
+                    bs_acc = form_acc("貸借対照表 (BS)")
+                    pl_acc = form_acc("損益計算書 (PL)")
+                    seizo_acc = form_acc("製造原価報告書")
+                    sg_acc = form_acc("販売費及び一般管理費明細書")
+                    ss_acc = form_acc("株主資本等変動計算書")                            
+
+                    acc = round((total_matches / total_items * 100), 2) if total_items > 0 else 0.0
+
+                    summary_list.append({
+                        "filename": pdf_name,
+                        "total_pages": total_pages,
+                        "total_items": total_items,
+                        "total_matches": total_matches,
+                        "accuracy": acc,
+                        "classification_total": classification_total,
+                        "classification_matches": classification_matches,
+                        "BS_acc": bs_acc,
+                        "PL_acc": pl_acc,
+                        "販管費_acc": sg_acc,
+                        "株主資本_acc": ss_acc,
+                        "製造原価_acc": seizo_acc
+                    })
+
+                    if page_df_list:
+                        detail_dfs.append((pdf_name, page_df_list))
+
+                KessanExcelExporter.export_kessan_report(
+                    excel_output_path, summary_list, detail_dfs, classification_details
+                )
+                logging.info(f"✨ 決算5表マトリックスExcelを出力しました: {excel_output_path}")
+
+            except Exception as e:
+                logging.error(f"❌ Excel出力中にエラーが発生しました: {e}")
+
+        else:
+            logging.warning("❌ 評価対象データが見つかりません。")
+
+    def _detect_title_by_formid(self, df: pandas.DataFrame) -> Optional[str]:
+        """データフレームの全セルからformid（01_010_02等）を検出し、正しい帳票タイトルを返す"""
+        try:
+            for col in df.columns:
+                for val in df[col].dropna():
+                    v_str = str(val).strip()
+                    for f_id, title in self.FORM_ID_MAP.items():
+                        if f_id in v_str:
+                            return title
+        except Exception:
+            pass
+        return None
 
     # ==========================================
     # CSV読み込み
     # ==========================================
-    def _load_csv_to_dataframe(self, gt_path: Path, pd_path: Path) -> Tuple[Optional[pandas.DataFrame], Optional[pandas.DataFrame]]:
-        """正解データと比較対象データの両方のcsvを読み込む。"""
-        gt_df: pandas.DataFrame = None
-        pd_df: pandas.DataFrame = None
-        try:
-            gt_df = cast(pandas.DataFrame, pandas.read_csv(gt_path, header=0, dtype=str, encoding=fileutils.detect_encoding(gt_path)))
-        except Exception as e:
-            logging.warning(f"CSV load error for {gt_path.name}: {e}")
-            return None, None
+    def _normalize_equity_matrix_detail(self, df: pandas.DataFrame) -> pandas.DataFrame:
+        """01_050_02 の横持ち表を、GTの25行構造と同じ位置へ展開する。
 
+        OCR文字・OCR数値は補正しない。GTにだけ存在する階層見出し位置は空行にし、
+        AIReadが認識した列見出し・行見出し・値を物理位置だけで縦持ちへ移す。
+        """
+        if df is None or df.empty or len(df.columns) < 7:
+            return df
+
+        src = df.fillna('').astype(str).reset_index(drop=True)
+        label_col = src.columns[0]
+        value_cols = list(src.columns[1:])
+        if len(value_cols) < 6 or len(src) < 7:
+            return df
+
+        def cell(row_idx: int, col) -> str:
+            if row_idx < 0 or row_idx >= len(src):
+                return ""
+            return str(src.iloc[row_idx].get(col, '')).strip()
+
+        def label(row_idx: int) -> str:
+            return cell(row_idx, label_col)
+
+        def out(account: str = "", amount: str = "") -> dict:
+            return {'account': str(account).strip(), 'amount_0': str(amount).strip()}
+
+        # GTの行順そのものに合わせた25行。3,4番目はGT側の
+        # 「利益剰余金」「その他利益剰余金」に対応するが、AIReadに直接の認識値が
+        # 無いため空欄のままにする（正解文字は絶対に注入しない）。
+        rows = [
+            out(value_cols[0]),
+            out(label(1), cell(1, value_cols[0])),
+            out(label(6), cell(6, value_cols[0])),
+            out(),
+            out(),
+            out(value_cols[1]),
+            out(label(1), cell(1, value_cols[1])),
+            out(label(6), cell(6, value_cols[1])),
+            out(value_cols[2]),
+            out(label(1), cell(1, value_cols[2])),
+            out(label(3), cell(3, value_cols[2])),
+            out(label(5), cell(5, value_cols[2])),
+            out(label(6), cell(6, value_cols[2])),
+            out(label(0) if label(0) else value_cols[3]),
+            out(label(1), cell(1, value_cols[3])),
+            out(label(5), cell(5, value_cols[3])),
+            out(label(6), cell(6, value_cols[3])),
+            out(value_cols[4]),
+            out(label(1), cell(1, value_cols[4])),
+            out(label(5), cell(5, value_cols[4])),
+            out(label(6), cell(6, value_cols[4])),
+            out(value_cols[5]),
+            out(label(1), cell(1, value_cols[5])),
+            out(label(5), cell(5, value_cols[5])),
+            out(label(6), cell(6, value_cols[5])),
+        ]
+        return pandas.DataFrame(rows, columns=['account', 'amount_0'])
+
+    def _compare_detail_by_formid(self, gt_file: Path, orig_name: str, page_index: int, region_items: list):
+        """formid付きGT detailを、AIReadの同一formid regionと帳票単位で比較する。
+
+        1物理ページに複数帳票がある場合、列構造が異なるregionを先に連結すると
+        fuzzy column alignmentが別帳票の列へ吸われる。そこで帳票ごとに独立して
+        column/row alignmentを行い、採点後のDataFrameだけを連結する。
+        """
         try:
-            pd_df = cast(pandas.DataFrame, pandas.read_csv(pd_path, header=0, dtype=str, encoding=fileutils.detect_encoding(pd_path)))
+            gt_all = pandas.read_csv(gt_file, dtype=str, keep_default_na=False)
         except Exception as e:
-            logging.warning(f"CSV load error for {pd_path.name}: {e}")
+            logging.warning("formid付きGT detail読込失敗: %s", e)
+            return None, [], []
+        if "formid" not in gt_all.columns:
+            return None, [], []
+
+        gt_ids = [str(v).strip() for v in gt_all["formid"].tolist() if str(v).strip()]
+        ordered_ids = list(dict.fromkeys(gt_ids))
+        merged_parts = []
+        scored_ids = []
+        temp_dir = self.session_dir / '.logical_ocr_inputs'
+        temp_dir.mkdir(parents=True, exist_ok=True)
+
+        for seq, formid in enumerate(ordered_ids, start=1):
+            gt_part = gt_all[gt_all["formid"].astype(str).str.strip() == formid].drop(columns=["formid"])
+            candidates = []
+            for item in sorted(region_items, key=lambda x: int(x.get('region', 0) or 0)):
+                if str(item.get('formid', '')).strip() != formid or not item.get('detail_file'):
+                    continue
+                path = self.predictions_dir / '.logical_region_details' / str(item['detail_file'])
+                if path.exists():
+                    candidates.append((item, path))
+            if not candidates:
+                logging.warning("  ⚠ P%d OCR detail: GT=%s に対応するregion detailなし", page_index + 1, formid)
+                # 予測空CSVを作り、GT全項目を不一致として残す
+                pd_part = pandas.DataFrame(columns=gt_part.columns)
+            else:
+                frames = [pandas.read_csv(path, dtype=str, keep_default_na=False) for _, path in candidates]
+                pd_part = pandas.concat(frames, ignore_index=True, sort=False).fillna('')
+                scored_ids.extend([formid] * len(candidates))
+                logging.info("  🧩 P%d OCR帳票別比較: %s -> %s", page_index + 1, formid,
+                             [f"R{x.get('region')}" for x, _ in candidates])
+
+            # 株主資本等変動計算書だけはAIReadが横持ちマトリクスで返すため、
+            # OCR文字を補正せず、比較用の縦持ちへ展開してから既存ロジックへ渡す。
+            if formid == "01_050_02" and not pd_part.empty:
+                pd_part = self._normalize_equity_matrix_detail(pd_part)
+                logging.info("  ↕ P%d 株主資本等変動計算書: 横持ち -> 縦持ち比較へ変換 (%d行)",
+                             page_index + 1, len(pd_part))
+
+            gt_tmp = temp_dir / f"{orig_name}_{page_index}_GT_{seq}.csv"
+            pd_tmp = temp_dir / f"{orig_name}_{page_index}_PD_{seq}.csv"
+            gt_part.to_csv(gt_tmp, index=False, encoding='utf-8-sig')
+            pd_part.to_csv(pd_tmp, index=False, encoding='utf-8-sig')
+            gt_df, pd_df = self._load_csv_to_dataframe(gt_tmp, pd_tmp)
+            if gt_df is None or pd_df is None:
+                continue
+            # P3の先頭「株主資本」は階層見出しで、横持ちAIRead表に対応セルがない。
+            # 位置対応の前にこの1行だけ外し、25行対25行で比較する。
+            if formid == "01_050_02" and len(gt_df) == len(pd_df) + 1 and not gt_df.empty:
+                first_gt = str(gt_df.iloc[0, 0]).strip()
+                if first_gt == "株主資本":
+                    gt_df = gt_df.iloc[1:].reset_index(drop=True)
+                    logging.info("  ↕ P%d 株主資本等変動計算書: 先頭構造見出し『株主資本』をOCR採点から除外", page_index + 1)
+            gt_df, pd_df = self._align_columns_by_fuzzy_match(gt_df, pd_df)
+            if formid == "01_050_02":
+                # 株主資本等変動計算書は上でGTと同じ論理位置へ25行展開済み。
+                # ここでfuzzy行寄せを行うと、OCR誤読された行名の類似度が低いため
+                # 正しい物理位置から後半へ飛ばされる。P3だけ位置対応で比較する。
+                gt_df = gt_df.reset_index(drop=True)
+                pd_df = pd_df.reset_index(drop=True)
+                gt_df['row_id'] = [f"r{i}" for i in range(len(gt_df))]
+                pd_df['row_id'] = [f"r{i}" for i in range(len(pd_df))]
+                logging.info("  ↕ P%d 株主資本等変動計算書: 25行の論理位置で直接比較", page_index + 1)
+            else:
+                gt_df, pd_df = self._align_rows_by_fuzzy_match(gt_df, pd_df)
+            part = pandas.merge(gt_df, pd_df, on='row_id', how='outer', indicator='row_presence', validate='many_to_many')
+            for _col in part.columns:
+                if _col != 'row_presence':
+                    part[_col] = part[_col].fillna('')
+            part[['item_count', 'match_count', 'accuracy']] = part.apply(self._calc_data_accuracy_by_row, axis=1)
+            # 帳票をまたいでrow_idが衝突しないようにする
+            part['row_id'] = part['row_id'].astype(str).map(lambda x: f"f{seq}_{x}")
+            part['logical_formid'] = formid
+            merged_parts.append(part)
+
+        if not merged_parts:
+            return None, [], []
+        merged = pandas.concat(merged_parts, ignore_index=True, sort=False)
+        for _col in merged.columns:
+            if _col != 'row_presence':
+                merged[_col] = merged[_col].fillna('')
+        unscored = [
+            str(x.get('formid', '')).strip() for x in region_items
+            if str(x.get('formid', '')).strip() in self.FORM_ID_MAP
+            and str(x.get('formid', '')).strip() not in ordered_ids
+        ]
+        merged.attrs['ocr_scored_formids'] = scored_ids
+        merged.attrs['ocr_unscored_formids'] = unscored
+        merged.attrs['logical_detail_grouped'] = True
+        return merged, scored_ids, unscored
+
+    def _load_csv_to_dataframe(self, gt_path: Path, pd_path: Path) -> Tuple[Optional[pandas.DataFrame], Optional[pandas.DataFrame]]:
+        """正解データと比較対象データの両方のcsvを読み込む。（数値のカンマで列が壊れるのを防止）"""
+        import csv
+
+        def safe_read_csv(file_path: Path) -> Optional[pandas.DataFrame]:
+            try:
+                enc = fileutils.detect_encoding(file_path)
+                
+                rows = []
+                with open(file_path, 'r', encoding=enc, newline='') as f:
+                    reader = csv.reader(f)
+                    for row in reader:
+                        if row:
+                            rows.append([str(cell).strip() for cell in row])
+
+                if not rows:
+                    return pandas.DataFrame()
+
+                max_cols = max(len(r) for r in rows)
+                padded_rows = [r + [''] * (max_cols - len(r)) for r in rows]
+
+                headers = padded_rows[0]
+                data_rows = padded_rows[1:]
+
+                col_names = []
+                counts = {}
+                for idx, h in enumerate(headers):
+                    h_str = h if h != '' else f"col_{idx}"
+                    counts[h_str] = counts.get(h_str, 0) + 1
+                    if counts[h_str] > 1:
+                        col_names.append(f"{h_str}_{counts[h_str]-1}")
+                    else:
+                        col_names.append(h_str)
+
+                df = pandas.DataFrame(data_rows, columns=col_names, dtype=str).fillna('')
+                return df
+
+            except Exception as e:
+                logging.warning(f"CSV load error for {file_path.name}: {e}")
+                return None
+
+        gt_df = safe_read_csv(gt_path)
+        pd_df = safe_read_csv(pd_path)
+
+        if gt_df is None or pd_df is None:
             return None, None
 
         return gt_df, pd_df
-
+    
     # ==========================================
     # 列の紐付け (Column Alignment)
     # ==========================================
     def _align_columns_by_fuzzy_match(self, gt_df: pandas.DataFrame, pd_df: pandas.DataFrame) -> Tuple[pandas.DataFrame, pandas.DataFrame]:
         """列名と列データの両方の特徴を捉え、GTとPDの列を物理的に同期させる"""
-        # ヘッダー行をデータの先頭行に差し込み、ヘッダ名を書き換えるので書き換える前のヘッダ行を控えておく
         gt_orig_cols = gt_df.columns.tolist()
         pd_orig_cols = pd_df.columns.tolist()
 
-        # 列全体（ヘッダー＋データ）の特徴文字列を作成
         gt_profiles = self._create_column_profiles(gt_df, gt_orig_cols)
         pd_profiles = self._create_column_profiles(pd_df, pd_orig_cols)
 
-        # 全組み合わせの類似度スコアを計算
         matches: List[Dict[str, float]] = self._calculate_column_similarity_scores(
             gt_orig_cols, gt_profiles, pd_orig_cols, pd_profiles
         )
 
-        # スコア順に1対1でペアを確定
         col_mapping: Dict[str, str] = self._determine_column_mapping(matches, pd_orig_cols)
 
-        # GT側の列名を c0_gt, c1_gt, ... に書き換え
         gt_df.columns = pandas.Index([f"c{i}_gt" for i in range(len(gt_orig_cols))])
 
-        # --- PD側の列名書き換え（直前のcXXを引き継いでネーミングする） ---
         pd_col_new_names = []
-        last_matched_col = "col_top"  # 紐付く前にいきなり過剰列が出た場合用
-        extra_counts = {}         # 同じ列の横に複数の過剰列が出た場合の枝番用
+        last_matched_col = "col_top"
+        extra_counts = {}
 
         for pd_col in pd_orig_cols:
             if pd_col in col_mapping:
-                # 紐付いた列の場合は、その名前(cXX)を適用し、最後に紐付いた名前として記憶
                 matched_name = col_mapping[pd_col]
                 pd_col_new_names.append(matched_name)
                 last_matched_col = matched_name
             else:
-                # 紐付かなかった列の場合は、直前に紐付いた名前を使って extra_cXX にする
                 extra_counts[last_matched_col] = extra_counts.get(last_matched_col, 0) + 1
                 count = extra_counts[last_matched_col]
 
                 suffix = f"_{count}" if count > 1 else ""
 
                 if last_matched_col == "col_top":
-                    # 一番最初の列(c0)より前に出たゴミ列
                     pd_col_new_names.append(f"extra_pre{suffix}")
                 else:
-                    # 例: c9 の次に出たゴミ列なら "extra_c9" になる
                     pd_col_new_names.append(f"extra_{last_matched_col}{suffix}")
 
-        # 全列名の末尾に"_pd"を追加
         pd_col_new_names = [name + "_pd" for name in pd_col_new_names]
         pd_df.columns = pandas.Index(pd_col_new_names)
-        # ------------------------------------------------------------------------
 
-        # ヘッダーは評価対象外。
-        # 以前はヘッダーをデータ行として追加していたため、
-        # 「account / 科目 / 金額」などが評価項目に混入していた。
+        # CSVのヘッダ名は列対応の判定には使うが、OCR正解率の採点対象にはしない。
+        # 以前は account / amount_0 / amount_1 等を1データ行として追加していたため、
+        # ヘッダ一致が「OCR正解1件」として混入していた。
         return gt_df, pd_df
 
 
     def _create_column_profiles(self, df: pandas.DataFrame, cols: List[str], max_len: int = 1500) -> List[str]:
-        """列のヘッダーとデータを結合し、列の特徴を表す文字列(プロファイル)を生成する"""
         profiles = []
-
         for col_name in cols:
-            # 1. 列データから空欄(NaN)を除外し、すべて文字列に変換する
             valid_data = df[col_name].dropna().astype(str)
-
-            # 2. データをひと繋ぎの文字列にする (例: ["100", "200"] -> "100200")
             data_str = "".join(valid_data)
-
-            # 3. ヘッダー名とデータをくっつけ、不要な記号などのノイズを除去（正規化）する
             normalized_str = self._normalize_text(col_name + data_str)
-
-            # 4. 計算量の爆発を防ぐため、指定文字数で切り出してリストに追加する
             profiles.append(normalized_str[:max_len])
-
         return profiles
 
 
     def _calculate_column_similarity_scores(
         self, gt_cols: List[str], gt_profs: List[str], pd_cols: List[str], pd_profs: List[str]
     ) -> List[Dict[str, float]]:
-        """GTとPDの全列の組み合わせに対して類似度スコアを計算する"""
         scored_matches = []
         for gt_idx, (gt_col, gt_profile) in enumerate(zip(gt_cols, gt_profs)):
             gt_header_norm = self._normalize_text(gt_col)
@@ -237,27 +867,21 @@ class Csv4dbEvaluator:
             for pd_idx, (pd_col, pd_profile) in enumerate(zip(pd_cols, pd_profs)):
                 pd_header_norm = self._normalize_text(pd_col)
 
-                header_sim = self._get_similarity(gt_header_norm, pd_header_norm) # ヘッダ文字列同士の類似度
-                full_sim = self._get_similarity(gt_profile, pd_profile) # ヘッダ＆値全てをマージした文字列同士の類似度
+                header_sim = self._get_similarity(gt_header_norm, pd_header_norm)
+                full_sim = self._get_similarity(gt_profile, pd_profile)
 
-                # ヘッダーもデータも全く似ていない場合は足切り
                 if header_sim < 0.3 and full_sim < 0.3:
                     continue
 
-                # 表における列の物理的位置の類似度
                 pos_sim = 1.0 - (abs(gt_idx / len(gt_cols) - pd_idx / len(pd_cols)))
-
-                # スコアを確定
                 score = (full_sim * 0.5) + (header_sim * 0.4) + (pos_sim * 0.1)
 
                 scored_matches.append({'gt_idx': gt_idx, 'pd_idx': pd_idx, 'score': score})
 
-        # スコアの高い順にソート
         return sorted(scored_matches, key=lambda x: x['score'], reverse=True)
 
 
     def _determine_column_mapping(self, sorted_matches: List[Dict[str, float]], pd_cols: List[str]) -> Dict[str, str]:
-        """スコアの高い順に列の紐付け（1対1）を確定する"""
         mapping = {}
         matched_gt, matched_pd = set(), set()
 
@@ -272,8 +896,6 @@ class Csv4dbEvaluator:
 
 
     def _insert_headers_as_data_row(self, df: pandas.DataFrame, original_headers: List[str]) -> None:
-        """元のヘッダー名をインデックス -1 のデータ行として挿入する"""
-        # ループを回さず、リストの結合で一括代入
         padding = [""] * (len(df.columns) - len(original_headers))
         df.loc[-1] = original_headers + padding
         df.index = df.index + 1
@@ -281,148 +903,177 @@ class Csv4dbEvaluator:
 
 
     # ==========================================
-    # 決算書評価対象外行の除外
-    # ==========================================
-    @classmethod
-    def _exclude_non_evaluation_rows(cls, df: pandas.DataFrame) -> pandas.DataFrame:
-        """
-        AIRead側に残る「評価対象外」の行を評価前に除外する。
-
-        除外対象:
-        - ヘッダー行（account / 科目 / 金額 など）
-        - 「資産の部」「負債の部」などの「○○の部」
-        - "(流動資産)" のような括弧だけの区分見出し
-
-        ※ 正解マスタ側は変更しない。
-        ※ 金額のカンマ・ピリオド等はここでは正規化しない。
-          それらはAIReadの生の結果として比較する。
-        """
-        if df.empty:
-            return df
-
-        account_col = cls._find_column(
-            df.columns,
-            ["account", "科目", "勘定科目", "item", "item_name"]
-        )
-
-        if account_col is None:
-            # account列を特定できない場合は、従来の比較処理をそのまま使う。
-            return df.reset_index(drop=True)
-
-        mask = pandas.Series(True, index=df.index)
-
-        for idx, value in df[account_col].fillna("").items():
-            account = str(value).strip()
-            normalized = cls._normalize_text(account)
-
-            # ヘッダー
-            if normalized in {"account", "科目", "勘定科目", "item", "itemname"}:
-                mask.loc[idx] = False
-                continue
-
-            # 「資産の部」「負債の部」「純資産の部」など
-            if account.endswith("の部"):
-                mask.loc[idx] = False
-                continue
-
-            # "(流動資産)" "(固定資産)" のような区分見出し
-            if cls._is_parenthesized_heading(account):
-                mask.loc[idx] = False
-
-        return df.loc[mask].reset_index(drop=True)
-
-    @staticmethod
-    def _find_column(columns, candidates: List[str]) -> Optional[str]:
-        normalized = {
-            str(col).strip().lower(): str(col)
-            for col in columns
-        }
-        for candidate in candidates:
-            found = normalized.get(candidate.lower())
-            if found is not None:
-                return found
-        return None
-
-    @staticmethod
-    def _is_parenthesized_heading(value: str) -> bool:
-        value = value.strip()
-        if len(value) < 3:
-            return False
-        pairs = [
-            ("(", ")"),
-            ("（", "）"),
-            ("【", "】"),
-            ("[", "]"),
-        ]
-        return any(value.startswith(left) and value.endswith(right)
-                   for left, right in pairs)
-
-    # ==========================================
     # 行の紐付け (Row Alignment)
     # ==========================================
-    def _align_rows_by_fuzzy_match(self, gt_df: pandas.DataFrame, pd_df: pandas.DataFrame) -> Tuple[pandas.DataFrame, pandas.DataFrame]:
-        """近似マッチングを用いて、正解行と推論行を紐付けたDataFrameを作成する"""
-        # 行マッチの推論のため、DataFrameの1行分のデータを、すべて横にガッチャンコして1つの文字列にしたリストを作成
-        gt_norm = gt_df.apply(lambda r: self._normalize_text(''.join(r.dropna().astype(str))), axis=1).tolist()
-        pd_norm = pd_df.apply(lambda r: self._normalize_text(''.join(r.dropna().astype(str))), axis=1).tolist()
+    def _align_rows_by_fuzzy_match(
+        self,
+        gt_df: pandas.DataFrame,
+        pd_df: pandas.DataFrame
+    ) -> Tuple[pandas.DataFrame, pandas.DataFrame]:
+        """
+        GTとPredictionの行順を保ちながら対応付ける。
+        科目列(c0)を主に使い、途中の欠損行・余分な行を許容する。
+        """
 
-        # 正解行を基準にマッチする推論行を探索
-        matched_pairs = []
-        used_pd_row_idx = set()
-        for gt_row_idx, gt_text in enumerate(gt_norm):
-            if not gt_text:
-                matched_pairs.append((gt_row_idx, None))
-                continue
+        gt_rows = gt_df.reset_index(drop=True)
+        pd_rows = pd_df.reset_index(drop=True)
 
-            best_idx, best_sim = None, -1.0
-            for pd_row_idx, pd_text in enumerate(pd_norm):
-                if pd_row_idx in used_pd_row_idx or not pd_text:
-                    continue
+        gt_count = len(gt_rows)
+        pd_count = len(pd_rows)
 
-                # 行の類似度計算
-                sim = self._get_similarity(gt_text, pd_text)
-                if sim > best_sim and sim > 0.35:
-                    best_sim, best_idx = sim, pd_row_idx
+        def row_similarity(gt_row, pd_row) -> float:
+            # 科目列を最優先
+            gt_label = self._normalize_text(
+                str(gt_row.get("c0_gt", ""))
+            )
+            pd_label = self._normalize_text(
+                str(pd_row.get("c0_pd", ""))
+            )
 
-            if best_idx is not None:
-                matched_pairs.append((gt_row_idx, best_idx))
-                used_pd_row_idx.add(best_idx)
+            # 行全体も補助的に見る
+            gt_full = self._normalize_text(
+                ''.join(gt_row.astype(str).tolist())
+            )
+            pd_full = self._normalize_text(
+                ''.join(pd_row.astype(str).tolist())
+            )
+
+            label_sim = self._get_similarity(gt_label, pd_label)
+            full_sim = self._get_similarity(gt_full, pd_full)
+
+            # 科目が両方ある場合は科目を主役にする
+            if gt_label and pd_label:
+                return (label_sim * 0.8) + (full_sim * 0.2)
+
+            # 科目が空欄の行は行全体で判断
+            return full_sim
+
+        # ------------------------------------------
+        # 動的計画法で「順番を壊さない」最適な対応を探す
+        # ------------------------------------------
+        gap_penalty = -0.25
+
+        dp = [
+            [0.0 for _ in range(pd_count + 1)]
+            for _ in range(gt_count + 1)
+        ]
+
+        trace = [
+            [None for _ in range(pd_count + 1)]
+            for _ in range(gt_count + 1)
+        ]
+
+        for i in range(1, gt_count + 1):
+            dp[i][0] = dp[i - 1][0] + gap_penalty
+            trace[i][0] = "gt_only"
+
+        for j in range(1, pd_count + 1):
+            dp[0][j] = dp[0][j - 1] + gap_penalty
+            trace[0][j] = "pd_only"
+
+        for i in range(1, gt_count + 1):
+            for j in range(1, pd_count + 1):
+
+                sim = row_similarity(
+                    gt_rows.iloc[i - 1],
+                    pd_rows.iloc[j - 1]
+                )
+
+                # 類似度0.5を基準に、
+                # 似ている行はプラス、似ていない行はマイナス
+                match_score = dp[i - 1][j - 1] + (sim - 0.5)
+
+                gt_only_score = (
+                    dp[i - 1][j] + gap_penalty
+                )
+
+                pd_only_score = (
+                    dp[i][j - 1] + gap_penalty
+                )
+
+                best_score = max(
+                    match_score,
+                    gt_only_score,
+                    pd_only_score
+                )
+
+                dp[i][j] = best_score
+
+                if best_score == match_score:
+                    trace[i][j] = "match"
+                elif best_score == gt_only_score:
+                    trace[i][j] = "gt_only"
+                else:
+                    trace[i][j] = "pd_only"
+
+        # ------------------------------------------
+        # 後ろからたどって対応関係を復元
+        # ------------------------------------------
+        aligned = []
+
+        i = gt_count
+        j = pd_count
+
+        while i > 0 or j > 0:
+
+            action = trace[i][j]
+
+            if action == "match":
+                aligned.append((i - 1, j - 1))
+                i -= 1
+                j -= 1
+
+            elif action == "gt_only":
+                aligned.append((i - 1, None))
+                i -= 1
+
+            elif action == "pd_only":
+                aligned.append((None, j - 1))
+                j -= 1
+
             else:
-                matched_pairs.append((gt_row_idx, None))
+                break
 
-        # 正解データと比較対象データの1列目にrow_idを挿入
-        gt_df.insert(0, 'row_id', [f"r{i}" for i in range(len(gt_df))])
-        pd_df.insert(0, 'row_id', "")
+        aligned.reverse()
 
-        # 1. どこにもマッチしなかったPD（過剰行）のインデックスを昇順リストで用意しておく
-        # （setの引き算を使って、全PDインデックスから使用済みを引く）
-        unmatched_pd_row_indices = sorted(set(range(len(pd_df))) - used_pd_row_idx)
+        # ------------------------------------------
+        # row_idを付ける
+        # ------------------------------------------
+        gt_df = gt_rows.copy()
+        pd_df = pd_rows.copy()
 
-        # 比較対象データのrow_idを採番
-        for gt_row_idx, pd_row_idx in matched_pairs:
-            if pd_row_idx is not None:
-                # 3. predictionテーブルにマッチした行がある場合、該当行より「上」にある過剰行をすべて吐き出す
-                suffix: int = 0
-                while unmatched_pd_row_indices and unmatched_pd_row_indices[0] < pd_row_idx:
-                    extra_row_idx = unmatched_pd_row_indices.pop(0) # 先頭から取り出して削除
-                    pd_df.loc[extra_row_idx, 'row_id'] = f"extra_r{gt_row_idx}" if suffix == 0 else f"extra_r{gt_row_idx}_{suffix}"
-                    suffix += 1
+        gt_df.insert(0, "row_id", "")
+        pd_df.insert(0, "row_id", "")
 
-                # 4. マッチした正規行を採番
-                pd_df.loc[pd_row_idx, 'row_id'] = f"r{gt_row_idx}"
+        # aligned の並び順そのものを row_id にする。
+        # 以前は Prediction 側だけの行を extra_r0, extra_r1... としていたため、
+        # 後段の自然順ソートで r0, extra_r0, r1, extra_r1... のように
+        # 本来の位置から離れて「互い違い」に表示されることがあった。
+        for pos, (gt_idx, pd_idx) in enumerate(aligned):
+            row_id = f"r{pos}"
+            if gt_idx is not None:
+                gt_df.loc[gt_idx, "row_id"] = row_id
+            if pd_idx is not None:
+                pd_df.loc[pd_idx, "row_id"] = row_id
 
-        # 5. 最後に残った（どこにも挟まれなかった末尾の）過剰行を採番
-        for extra_row_idx in unmatched_pd_row_indices:
-            pd_df.loc[extra_row_idx, 'row_id'] = f"extra_r{extra_row_idx}"
+        # 念のため、対応復元に含まれなかった行があれば末尾へ送る。
+        next_pos = len(aligned)
+        for idx in gt_df.index:
+            if not gt_df.loc[idx, "row_id"]:
+                gt_df.loc[idx, "row_id"] = f"r{next_pos}"
+                next_pos += 1
+
+        for idx in pd_df.index:
+            if not pd_df.loc[idx, "row_id"]:
+                pd_df.loc[idx, "row_id"] = f"r{next_pos}"
+                next_pos += 1
 
         return gt_df, pd_df
-
 
     # ==========================================
     # 個別レポート生成 (individual Report)
     # ==========================================
     def _save_individual_reports(self, diff_df: pandas.DataFrame, merged_df: pandas.DataFrame, file_name: str) -> None:
-        """個別ファイルの差分結果を、用途別のCSV群とHTMLで保存する"""
         file_stem = Path(file_name).stem
 
         individual_dir = self.session_dir / "individual reports"
@@ -430,27 +1081,22 @@ class Csv4dbEvaluator:
 
         ordered_cols = self._determine_report_column_order(merged_df)
 
-        # --- CSV保存ディレクトリの準備 ---
         csv_dir = individual_dir / "csv" / file_stem
         csv_dir.mkdir(parents=True, exist_ok=True)
 
-        # 1. 【差分リストCSV】分析・集計用（縦積み形式）
         diff_file = f"diff_list_{file_name}"
         if not diff_df.empty:
             diff_list_df = self._format_diff_for_csv(diff_df, ordered_cols)
             diff_list_df.to_csv(csv_dir / diff_file, index=False, encoding="utf-8-sig")
         else:
-            # 空のDataFrameを保存する場合
             pandas.DataFrame({"message": ["no differences found."]}).to_csv(csv_dir / f"diff_list_{file_name}", index=False, encoding="utf-8-sig")
         logging.info(f"📄 差分レポート(CSV)を保存: {csv_dir / diff_file}")
 
-        # 2. 【全データ比較CSV】全体俯瞰用（横並び形式）
         full_comparison_file = f"full_comparison_{file_name}"
         full_comparison_df = self._format_full_comparison_csv(merged_df, ordered_cols)
         full_comparison_df.to_csv(csv_dir / full_comparison_file, index=False, encoding="utf-8-sig")
         logging.info(f"📄 全データ比較レポートを保存: {csv_dir / full_comparison_file}")
 
-        # --- HTML出力 (視認性の高いカスタムレポート) ---
         html_dir = individual_dir / "html"
         html_dir.mkdir(parents=True, exist_ok=True)
         html_file = f"diff_{file_stem}.html"
@@ -459,11 +1105,6 @@ class Csv4dbEvaluator:
 
 
     def _determine_report_column_order(self, merged_df: pandas.DataFrame) -> List[str]:
-        """
-        過剰列(extra_c0等)が推論結果の元々の位置に表示されるように、列の並び順を決定する
-        c0_gt, c0_pd, c1_gt, c1_pd, ...
-        → c0, c1, c2, ... （_gt, _pdを削除して、重複排除される）
-        """
         gt_cols = [re.sub(r'_gt$', '', c) for c in merged_df.columns if c.endswith('_gt')]
         pd_cols = [re.sub(r'_pd$', '', c) for c in merged_df.columns if c.endswith('_pd')]
 
@@ -477,22 +1118,16 @@ class Csv4dbEvaluator:
         return ordered_cols
 
 
-    # 個別CSVレポート生成 (CSV Report)
     def _format_diff_for_csv(self, diff_df: pandas.DataFrame, ordered_cols: List[str]) -> pandas.DataFrame:
-        """
-        横長の差分データを、人が目視で確認・フィルタリングしやすい
-        「エラー箇所のみを縦にリストアップした形式」に変換する。
-        """
         csv_rows = []
         for _, row in diff_df.iterrows():
             row_id = row.get('row_id', '')
             merge_status = row.get('row_presence', 'both')
 
             for col in ordered_cols:
-                gt_val = str(row.get(f"{col}_gt", "")).strip()
-                pd_val = str(row.get(f"{col}_pd", "")).strip()
-
-                # 一致しているセルは出力しない（エラー箇所のみ抽出）
+                gt_val = str(row.get(f"{col}_gt", "")).replace(' ', '').strip()
+                pd_val = str(row.get(f"{col}_pd", "")).replace(' ', '').strip()
+                
                 if gt_val == pd_val:
                     continue
 
@@ -514,15 +1149,8 @@ class Csv4dbEvaluator:
 
 
     def _format_full_comparison_csv(self, merged_df: pandas.DataFrame, ordered_cols: List[str]) -> pandas.DataFrame:
-        """
-        全ての行・列を含み、GTとPDを横に並べたCSV用DataFrameを作成する。
-        Excelで開いた際、左側に管理情報（IDや精度）、右側にデータ本体が来るように構成。
-        """
-        # 管理用カラムの定義
         base_cols = ['row_id', 'row_presence', 'accuracy', "match_count", "item_count"]
 
-        # データの並び替え: 各列IDごとに GT と PD を隣り合わせる
-        # 例: [row_id, row_presence, accuracy, c0_gt, c0_pd, c1_gt, c1_pd, ...]
         data_cols = []
         for col in ordered_cols:
             if f"{col}_gt" in merged_df.columns:
@@ -533,15 +1161,10 @@ class Csv4dbEvaluator:
         return merged_df[base_cols + data_cols].copy()
 
 
-    # 個別HTMLレポート生成 (HTML Report)
     def _export_html_report(self, merged_df: pandas.DataFrame, output_path: Path) -> None:
-        """Pandas DataFrameから直接視認性の高い差分HTMLを生成・保存する"""
-
-        # HTMLbody部のテーブルを構築
         ordered_cols = self._determine_report_column_order(merged_df)
         html_table = self._build_html_table(merged_df, ordered_cols)
 
-        # CSS定義
         custom_style = """
         <style>
             body { font-family: "Helvetica Neue", Helvetica, "Segoe UI", Arial, sans-serif; color: #333; margin: 30px; line-height: 1.4; }
@@ -561,7 +1184,6 @@ class Csv4dbEvaluator:
         </style>
         """
 
-        # フルHTMLの構築
         full_html = f"""
         <!DOCTYPE html>
         <html lang="ja">
@@ -588,15 +1210,12 @@ class Csv4dbEvaluator:
 
 
     def _build_html_table(self, merged_df: pandas.DataFrame, ordered_cols: List[str]) -> str:
-        """データフレームからHTMLテーブルのタグ(文字列)を構築する"""
         lines = ['<table>', '<thead>', '<tr><th class="status-col">@@</th>']
 
-        # 1行目: 列名
         for col in ordered_cols:
             lines.append(f'<th>{col}</th>')
         lines.append('</tr>')
 
-        # 2行目: 列ステータス (--- / +++)
         lines.append('<tr class="col-status-row"><td class="status-col">@@</td>')
         for col in ordered_cols:
             has_gt = f"{col}_gt" in merged_df.columns
@@ -606,7 +1225,6 @@ class Csv4dbEvaluator:
             else: lines.append('<td></td>')
         lines.append('</tr></thead><tbody>')
 
-        # データ行
         for _, row in merged_df.iterrows():
             r_status = "row-missing" if row['row_presence'] == 'left_only' else \
                        "row-excess" if row['row_presence'] == 'right_only' else \
@@ -639,32 +1257,21 @@ class Csv4dbEvaluator:
     # サマリーレポート生成 (Summary Report)
     # ==========================================
     def _save_summary_report(self, all_results: List[Tuple[str, pandas.DataFrame]]) -> None:
-        """
-        全評価データから統計情報を抽出し、サマリーレポートをセッションフォルダ直下にCSV出力する。
-        """
-        # フォルダは切らずに、ファイル名でサマリーであることを明示
         summary_path = self.session_dir / "summary_report.csv"
 
         file_metrics = []
         for file_name, df in all_results:
-            # データ行のみを抽出
             if df.empty:
                 continue
 
-            # --- 行の統計 ---
             missing_rows = len(df[df['row_presence'] == 'left_only'])
             excess_rows = len(df[df['row_presence'] == 'right_only'])
 
-            # --- 列（カラム）の統計 ---
-            # 接尾辞を除いたベースとなる列名セットを作成
             gt_bases = {col.replace('_gt', '') for col in df.columns if col.endswith('_gt')}
             pd_bases = {col.replace('_pd', '') for col in df.columns if col.endswith('_pd')}
-            # 欠損列: GTにはあるがPDにはない列
             missing_cols = len(gt_bases - pd_bases)
-            # 過剰列: PDにはあるがGTにはない列
             excess_cols = len(pd_bases - gt_bases)
 
-            # --- 指標の集計 ---
             file_metrics.append({
                 'ファイル名': file_name,
                 '項目精度(%)': round((df['match_count'].sum() / df['item_count'].sum() * 100), 2) if df['item_count'].sum() > 0 else 0,
@@ -676,11 +1283,9 @@ class Csv4dbEvaluator:
                 '過剰列数(+++)': excess_cols
             })
 
-        # CSV保存（精度が低い順にソートして、改善優先度を見やすくする）
         file_summary_df = pandas.DataFrame(file_metrics)
         file_summary_df.to_csv(summary_path, index=False, encoding="utf-8-sig")
 
-        # コンソール表示
         logging.info(f"📊 Summary Report Created: {summary_path}\n")
 
 
@@ -689,20 +1294,9 @@ class Csv4dbEvaluator:
     # ==========================================
     @staticmethod
     def _normalize_text(text: str) -> str:
-        """
-        行・列の位置合わせ用の文字列正規化。
-
-        注意:
-        - 金額のカンマやピリオドを「正解扱い」にする正規化ではない。
-        - 実際の一致判定は _calc_data_accuracy_by_row で元値を比較する。
-        """
-        value = str(text)
-
-        # 科目名の先頭に付く連番（例: "1 現金", "01.現金"）は評価対象外。
-        value = re.sub(r'^\s*\d+[\.．、,\s:：\-－]*', '', value)
-
-        return re.sub(r'[【】\(\)（）※\*＊,、\s\t]', '', value)
-
+        """★カンマもピリオドも一切消さない！スペース（空白・タブ・全角空白）のみを除去して100%厳格評価★"""
+        text_str = str(text or '')
+        return re.sub(r'[\s\t\u3000]', '', text_str)
 
     @staticmethod
     def _get_similarity(text1: str, text2: str) -> float:
@@ -716,7 +1310,10 @@ class Csv4dbEvaluator:
     @staticmethod
     def _calc_data_accuracy_by_row(row: pandas.Series) -> pandas.Series:
         """行単位の正解データ数/推論データと正解データとの一致数/精度を計算"""
-        # "_gt", "_pd"で終わる列をそれぞれ抽出
+        
+        # CSVヘッダは _load_csv_to_dataframe() で既に列名として除外済み。
+        # ここで r0 を除外すると、各帳票の「最初の実データ行」を採点しなくなるため、
+        # row_id による特別扱いはしない。
         gt_cols = [col for col in row.index if col.endswith('_gt')]
 
         item_count = 0
@@ -724,28 +1321,36 @@ class Csv4dbEvaluator:
 
         for gt_col in gt_cols:
             gt_val = str(row[gt_col]) if pandas.notna(row[gt_col]) else ""
-            if gt_val == "":
-                continue
-
-            item_count += 1
 
             pd_col = gt_col.replace('_gt', '_pd')
+            pd_val = ""
             if pd_col in row.index:
-                # 値の取得
                 pd_val = str(row[pd_col]) if pandas.notna(row[pd_col]) else ""
 
-                # 一致判定（文字列として比較）
-                if gt_val == pd_val:
-                    match_count += 1
+            # GTもPredictionも空なら評価対象外
+            if gt_val == "" and pd_val == "":
+                continue
+
+            # どちらか一方に値があれば評価対象
+            item_count += 1
+
+            gt_norm = Csv4dbEvaluator._normalize_text(gt_val)
+            pd_norm = Csv4dbEvaluator._normalize_text(pd_val)
+
+            if gt_norm == pd_norm:
+                match_count += 1
+
+        # 分母はGT（正解マスタ）に存在する評価項目だけで固定する。
+        # Prediction側だけに存在する追加列は、列ずれや帳票固有の余分な出力であり、
+        # ここで分母へ加えると同じGTでもAIRead出力形状によって総項目数が変動する。
+        # GT空欄 / Prediction値ありの不一致は、対応済みの *_gt / *_pd ペア側で判定する。
 
         accuracy = (match_count / item_count) * 100 if item_count > 0 else 0
         accuracy = round(accuracy, 2)
 
-        # 3つの値をセットで返す
         return pandas.Series([item_count, match_count, accuracy])
-
 
     def _extract_differences(self, df: pandas.DataFrame) -> pandas.DataFrame:
         """不一致行のみを抽出する（並び順は抽出元の自然な状態を維持する）"""
-        # ソート処理を削除し、DataFrameの元の綺麗な並び順を維持したまま抽出する
         return df[(df['accuracy'] < 100) | (df['row_presence'] != 'both')].copy()
+    
