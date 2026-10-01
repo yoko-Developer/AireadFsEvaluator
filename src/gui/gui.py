@@ -368,9 +368,6 @@ def run_evaluation_process():
                 reader = csv.DictReader(f)
 
                 for idx, row in enumerate(reader, 1):
-                    # CSVのヘッダー行はHTMLにも表示しない
-                    if str(row.get("row_id", "")).strip() == "r0":
-                        continue
                     
                     # c0, c1, c2... の採点対象列を全部表示する
                     column_numbers = sorted({
