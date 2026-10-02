@@ -15,6 +15,7 @@ import pandas
 from src import constants as const
 from src.utils import fileutils 
 from src.eval.excel_exporter import KessanExcelExporter
+from src.service.classification_service import ClassificationService
 
 class Csv4dbEvaluator:
     """
@@ -37,6 +38,7 @@ class Csv4dbEvaluator:
         self.ground_truth_dir: Path = ground_truth_dir
         self.results_base_dir: Path = results_base_dir
         self.session_dir: Path = Path()
+        self.classification_service = ClassificationService(self.FORM_ID_MAP)
 
         self._prepare()
 
@@ -321,63 +323,44 @@ class Csv4dbEvaluator:
                     page_title_map = {}
                     classification_ok_map = {}
                     logical_formids_map = {}
+                    classification_result_map = {}
 
                     for page_file_name, df in page_list:
                         if "_detail" not in page_file_name:
                             page_key = page_file_name.replace(".csv", "")
 
-                            gt_ids = list(df.attrs.get("raw_gt_formids", []))
-                            raw_pd_ids = list(df.attrs.get("raw_pd_formids", []))
-                            pd_ids = [x for x in raw_pd_ids if x in self.FORM_ID_MAP]
+                            result = self.classification_service.classify(
+                                pdf_name=pdf_name,
+                                page_file_name=page_file_name,
+                                df=df,
+                                logical_sidecar=logical_sidecar,
+                            )
 
-                            # Prefer the pre-consolidation region list.  pdf_name is the original PDF stem.
-                            page_match = re.search(r'_(\d+)\.csv$', page_file_name)
-                            page_index = int(page_match.group(1)) if page_match else -1
-                            region_items = logical_sidecar.get(pdf_name, {}).get(str(page_index), [])
-                            if region_items:
-                                sidecar_ids = [str(x.get("formid", "")).strip() for x in region_items]
-                                pd_ids = [x for x in sidecar_ids if x in self.FORM_ID_MAP]
-                                raw_pd_ids = sidecar_ids
-                                logging.info("  🧩 P%d region formid(source): %s", page_index + 1, sidecar_ids)
+                            classification_result_map[page_key] = result
 
-                            # Prefer the pre-consolidation region list.  pdf_name is the original PDF stem.
-                            page_match = re.search(r'_(\d+)\.csv$', page_file_name)
-                            page_index = int(page_match.group(1)) if page_match else -1
-                            region_items = logical_sidecar.get(pdf_name, {}).get(str(page_index), [])
-                            if region_items:
-                                sidecar_ids = [str(x.get("formid", "")).strip() for x in region_items]
-                                pd_ids = [x for x in sidecar_ids if x in self.FORM_ID_MAP]
-                                raw_pd_ids = sidecar_ids
-                                logging.info("  🧩 P%d region formid(source): %s", page_index + 1, sidecar_ids)
-                            if not gt_ids and not raw_pd_ids:
-                                for _, row in df.iterrows():
-                                    gt_formid = str(row.get("c1_gt", "") or "").strip()
-                                    pd_formid = str(row.get("c1_pd", "") or "").strip()
-                                    if gt_formid and gt_formid != "formid":
-                                        gt_ids.append(gt_formid)
-                                    if pd_formid and pd_formid != "formid" and pd_formid in self.FORM_ID_MAP:
-                                        pd_ids.append(pd_formid)
+                            gt_ids = list(result["gt_formids"])
+                            pd_ids = list(result["pd_formids"])
 
-                            page_match = re.search(r'_(\d+)\.csv$', page_file_name)
-                            page_no = int(page_match.group(1)) + 1 if page_match else 0
-                            gt_ids = logical_gt_formids(pdf_name, page_no, gt_ids)
                             logical_formids_map[page_key] = list(gt_ids)
 
                             if gt_ids:
-                                # OCR明細は物理ページ単位なので、表示タイトルは複数帳票を連結する。
-                                titles = [self.FORM_ID_MAP.get(fid, fid) for fid in gt_ids]
+                                titles = [
+                                    self.FORM_ID_MAP.get(fid, fid)
+                                    for fid in gt_ids
+                                ]
                                 title_counts = Counter(titles)
                                 shown = []
+
                                 for title in dict.fromkeys(titles):
                                     n = title_counts[title]
-                                    shown.append(f"{title} × {n}" if n > 1 else title)
-                                page_title_map[page_key] = " ＋ ".join(shown)
-                                # 複数帳票ページでは完全一致でなくても、AIRead分類がGTの
-                                # 論理帳票と1件以上一致すれば、そのdetail CSVをOCR採点する。
-                                gt_counter = Counter(gt_ids)
-                                pd_counter = Counter(pd_ids)
-                                classification_ok_map[page_key] = sum((gt_counter & pd_counter).values()) > 0
-                    
+                                    shown.append(
+                                        f"{title} ? {n}" if n > 1 else title
+                                    )
+
+                                page_title_map[page_key] = " / ".join(shown)
+
+                            classification_ok_map[page_key] = result["is_ocr_target"]
+
                     form_totals = {
                         "貸借対照表 (BS)": [0, 0],
                         "損益計算書 (PL)": [0, 0],
@@ -393,73 +376,15 @@ class Csv4dbEvaluator:
 
                         # 分類データ（_detail ではない通常CSV）
                         if "_detail" not in page_file_name:
-                            # 1物理ページに複数帳票がある場合を落とさない。
-                            # 重複帳票（例: BS×2）も意味があるため set にはしない。
-                            gt_formids: List[str] = list(df.attrs.get("raw_gt_formids", []))
-                            raw_pd_formids = list(df.attrs.get("raw_pd_formids", []))
-                            pd_formids: List[str] = [x for x in raw_pd_formids if x in self.FORM_ID_MAP]
+                            page_key = page_file_name.replace(".csv", "")
+                            result = classification_result_map[page_key]
 
-                            # 分類集計も、物理ページへ統合する前の region formid を正として使う。
-                            # ここが実際に classification_matches を加算する経路。
-                            page_match = re.search(r'_(\d+)\.csv$', page_file_name)
-                            page_index = int(page_match.group(1)) if page_match else -1
-                            region_items = logical_sidecar.get(pdf_name, {}).get(str(page_index), [])
-                            if region_items:
-                                sidecar_ids = [str(x.get("formid", "")).strip() for x in region_items]
-                                raw_pd_formids = sidecar_ids
-                                pd_formids = [x for x in sidecar_ids if x in self.FORM_ID_MAP]
-                                logging.info("  🧩 P%d 分類集計 region formid: %s", page_index + 1, sidecar_ids)
+                            classification_details.append(result)
 
-                            if not gt_formids and not raw_pd_formids:
-                                for _, row in df.iterrows():
-                                    gt = str(row.get("c1_gt", "") or "").strip()
-                                    pd = str(row.get("c1_pd", "") or "").strip()
-                                    if gt and gt != "formid":
-                                        gt_formids.append(gt)
-                                    if pd and pd != "formid" and pd in self.FORM_ID_MAP:
-                                        pd_formids.append(pd)
-
-                            # GUI/Markdownと同じ分類対象判定に統一する。
-                            # 表紙など GT formid が空/unknown/none/不明 のページは評価対象外。
-                            # それ以外はFORM_ID_MAP未登録でも分類対象に残す。
-                            gt_formids = [x for x in gt_formids if x.lower() not in {"unknown", "none", "不明"}]
-                            is_classification_target = bool(gt_formids)
-
-                            # 分類結果詳細用に、評価対象外ページも含めて1ページ1行で保持する。
-                            page_match = re.search(r'_(\d+)\.csv$', page_file_name)
-                            page_no = int(page_match.group(1)) + 1 if page_match else ""
-                            if page_no:
-                                gt_formids = logical_gt_formids(pdf_name, page_no, gt_formids)
-                            logging.info("  🔎 P%s GT formid: %s", page_no, gt_formids or ["なし"])
-                            logging.info("  🔎 P%s AIRead formid(決算5表): %s", page_no, pd_formids or ["なし"])
-                            gt_counter = Counter(gt_formids)
-                            pd_counter = Counter(pd_formids)
-                            page_total_forms = sum(gt_counter.values())
-                            page_match_forms = sum((gt_counter & pd_counter).values())
-                            gt_title = (
-                                " ＋ ".join(self.FORM_ID_MAP.get(x, x) for x in gt_formids)
-                                if is_classification_target else "評価対象外"
-                            )
-                            pd_title = (
-                                " ＋ ".join(self.FORM_ID_MAP.get(x, x) for x in pd_formids)
-                                if pd_formids else "不明"
-                            )
-                            classification_details.append({
-                                "filename": pdf_name, "page": page_no,
-                                "gt_title": gt_title, "pd_title": pd_title,
-                                "gt_formid": " / ".join(gt_formids),
-                                "pd_formid": " / ".join(pd_formids),
-                                "gt_formids": gt_formids, "pd_formids": pd_formids,
-                                "is_target": is_classification_target,
-                                "is_match": is_classification_target and gt_counter == pd_counter,
-                                "classification_total": page_total_forms,
-                                "classification_matches": page_match_forms,
-                            })
-
-                            if is_classification_target:
+                            if result["is_target"]:
                                 total_pages += 1
-                                classification_total += page_total_forms
-                                classification_matches += page_match_forms
+                                classification_total += result["classification_total"]
+                                classification_matches += result["classification_matches"]
 
                             continue
 

@@ -512,7 +512,8 @@ class KessanExcelExporter:
             c6.alignment = Alignment(horizontal="center", vertical="center")
 
             # OCRは詳細シートと同じ構造見出し除外ルールで再集計する。
-            pdf_ocr_matches, pdf_ocr_total = cls.get_ocr_stats(detail_dfs[[x[0] for x in detail_dfs].index(filename)][1]) if filename in [x[0] for x in detail_dfs] else (0, 0)
+            pdf_ocr_total = int(data.get('total_items', 0) or 0)
+            pdf_ocr_matches = int(data.get('total_matches', 0) or 0)
 
             c7 = ws_matrix.cell(row=row_idx, column=7, value=pdf_ocr_total)
             c7.number_format = '#,##0'
