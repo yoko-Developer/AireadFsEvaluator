@@ -195,7 +195,7 @@ class Csv4dbEvaluator:
             if grouped_merged is None and "_detail" in pd_file.name and "01_050_02" in base_gt_ids:
                 try:
                     raw_p3 = pandas.read_csv(pd_load_file, dtype=str, keep_default_na=False)
-                    normalized_p3 = self._normalize_equity_matrix_detail(raw_p3)
+                    normalized_p3 = self.ocr_evaluation_service._normalize_equity_matrix_detail(raw_p3)
                     if normalized_p3 is not None and not normalized_p3.empty and list(normalized_p3.columns) == ["account", "amount_0"]:
                         temp_dir = self.session_dir / '.logical_ocr_inputs'
                         temp_dir.mkdir(parents=True, exist_ok=True)
@@ -523,64 +523,6 @@ class Csv4dbEvaluator:
     # ==========================================
     # CSV読み込み
     # ==========================================
-    def _normalize_equity_matrix_detail(self, df: pandas.DataFrame) -> pandas.DataFrame:
-        """01_050_02 の横持ち表を、GTの25行構造と同じ位置へ展開する。
-
-        OCR文字・OCR数値は補正しない。GTにだけ存在する階層見出し位置は空行にし、
-        AIReadが認識した列見出し・行見出し・値を物理位置だけで縦持ちへ移す。
-        """
-        if df is None or df.empty or len(df.columns) < 7:
-            return df
-
-        src = df.fillna('').astype(str).reset_index(drop=True)
-        label_col = src.columns[0]
-        value_cols = list(src.columns[1:])
-        if len(value_cols) < 6 or len(src) < 7:
-            return df
-
-        def cell(row_idx: int, col) -> str:
-            if row_idx < 0 or row_idx >= len(src):
-                return ""
-            return str(src.iloc[row_idx].get(col, '')).strip()
-
-        def label(row_idx: int) -> str:
-            return cell(row_idx, label_col)
-
-        def out(account: str = "", amount: str = "") -> dict:
-            return {'account': str(account).strip(), 'amount_0': str(amount).strip()}
-
-        # GTの行順そのものに合わせた25行。3,4番目はGT側の
-        # 「利益剰余金」「その他利益剰余金」に対応するが、AIReadに直接の認識値が
-        # 無いため空欄のままにする（正解文字は絶対に注入しない）。
-        rows = [
-            out(value_cols[0]),
-            out(label(1), cell(1, value_cols[0])),
-            out(label(6), cell(6, value_cols[0])),
-            out(),
-            out(),
-            out(value_cols[1]),
-            out(label(1), cell(1, value_cols[1])),
-            out(label(6), cell(6, value_cols[1])),
-            out(value_cols[2]),
-            out(label(1), cell(1, value_cols[2])),
-            out(label(3), cell(3, value_cols[2])),
-            out(label(5), cell(5, value_cols[2])),
-            out(label(6), cell(6, value_cols[2])),
-            out(label(0) if label(0) else value_cols[3]),
-            out(label(1), cell(1, value_cols[3])),
-            out(label(5), cell(5, value_cols[3])),
-            out(label(6), cell(6, value_cols[3])),
-            out(value_cols[4]),
-            out(label(1), cell(1, value_cols[4])),
-            out(label(5), cell(5, value_cols[4])),
-            out(label(6), cell(6, value_cols[4])),
-            out(value_cols[5]),
-            out(label(1), cell(1, value_cols[5])),
-            out(label(5), cell(5, value_cols[5])),
-            out(label(6), cell(6, value_cols[5])),
-        ]
-        return pandas.DataFrame(rows, columns=['account', 'amount_0'])
-
     def _load_csv_to_dataframe(self, gt_path: Path, pd_path: Path) -> Tuple[Optional[pandas.DataFrame], Optional[pandas.DataFrame]]:
         """正解データと比較対象データの両方のcsvを読み込む。（数値のカンマで列が壊れるのを防止）"""
         import csv
