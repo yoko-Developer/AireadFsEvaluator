@@ -208,7 +208,7 @@ class Csv4dbEvaluator:
                     logging.warning("⚠ P3旧GTルートの縦持ち変換に失敗: %s", e)
 
             if grouped_merged is None:
-                gt_df, pd_df = self._load_csv_to_dataframe(gt_file, pd_load_file)
+                gt_df, pd_df = self.ocr_evaluation_service._load_csv_to_dataframe(gt_file, pd_load_file)
                 if gt_df is None or pd_df is None:
                     continue
             else:
@@ -237,7 +237,7 @@ class Csv4dbEvaluator:
                         gt_df = gt_df.iloc[1:].reset_index(drop=True)
                         logging.info("  ↕ P%d P3旧GTルート: 先頭構造見出し『株主資本』をOCR採点から除外", page_index + 1)
 
-                gt_df, pd_df = self._align_columns_by_fuzzy_match(gt_df, pd_df)
+                gt_df, pd_df = self.ocr_evaluation_service._align_columns_by_fuzzy_match(gt_df, pd_df)
                 if p3_position_mode:
                     # P3は既にGTと同じ25行位置へ展開済み。誤読された行名でfuzzy再配置しない。
                     gt_df = gt_df.reset_index(drop=True)
@@ -523,151 +523,6 @@ class Csv4dbEvaluator:
     # ==========================================
     # CSV読み込み
     # ==========================================
-    def _load_csv_to_dataframe(self, gt_path: Path, pd_path: Path) -> Tuple[Optional[pandas.DataFrame], Optional[pandas.DataFrame]]:
-        """正解データと比較対象データの両方のcsvを読み込む。（数値のカンマで列が壊れるのを防止）"""
-        import csv
-
-        def safe_read_csv(file_path: Path) -> Optional[pandas.DataFrame]:
-            try:
-                enc = fileutils.detect_encoding(file_path)
-                
-                rows = []
-                with open(file_path, 'r', encoding=enc, newline='') as f:
-                    reader = csv.reader(f)
-                    for row in reader:
-                        if row:
-                            rows.append([str(cell).strip() for cell in row])
-
-                if not rows:
-                    return pandas.DataFrame()
-
-                max_cols = max(len(r) for r in rows)
-                padded_rows = [r + [''] * (max_cols - len(r)) for r in rows]
-
-                headers = padded_rows[0]
-                data_rows = padded_rows[1:]
-
-                col_names = []
-                counts = {}
-                for idx, h in enumerate(headers):
-                    h_str = h if h != '' else f"col_{idx}"
-                    counts[h_str] = counts.get(h_str, 0) + 1
-                    if counts[h_str] > 1:
-                        col_names.append(f"{h_str}_{counts[h_str]-1}")
-                    else:
-                        col_names.append(h_str)
-
-                df = pandas.DataFrame(data_rows, columns=col_names, dtype=str).fillna('')
-                return df
-
-            except Exception as e:
-                logging.warning(f"CSV load error for {file_path.name}: {e}")
-                return None
-
-        gt_df = safe_read_csv(gt_path)
-        pd_df = safe_read_csv(pd_path)
-
-        if gt_df is None or pd_df is None:
-            return None, None
-
-        return gt_df, pd_df
-    
-    # ==========================================
-    # 列の紐付け (Column Alignment)
-    # ==========================================
-    def _align_columns_by_fuzzy_match(self, gt_df: pandas.DataFrame, pd_df: pandas.DataFrame) -> Tuple[pandas.DataFrame, pandas.DataFrame]:
-        """列名と列データの両方の特徴を捉え、GTとPDの列を物理的に同期させる"""
-        gt_orig_cols = gt_df.columns.tolist()
-        pd_orig_cols = pd_df.columns.tolist()
-
-        gt_profiles = self._create_column_profiles(gt_df, gt_orig_cols)
-        pd_profiles = self._create_column_profiles(pd_df, pd_orig_cols)
-
-        matches: List[Dict[str, float]] = self._calculate_column_similarity_scores(
-            gt_orig_cols, gt_profiles, pd_orig_cols, pd_profiles
-        )
-
-        col_mapping: Dict[str, str] = self._determine_column_mapping(matches, pd_orig_cols)
-
-        gt_df.columns = pandas.Index([f"c{i}_gt" for i in range(len(gt_orig_cols))])
-
-        pd_col_new_names = []
-        last_matched_col = "col_top"
-        extra_counts = {}
-
-        for pd_col in pd_orig_cols:
-            if pd_col in col_mapping:
-                matched_name = col_mapping[pd_col]
-                pd_col_new_names.append(matched_name)
-                last_matched_col = matched_name
-            else:
-                extra_counts[last_matched_col] = extra_counts.get(last_matched_col, 0) + 1
-                count = extra_counts[last_matched_col]
-
-                suffix = f"_{count}" if count > 1 else ""
-
-                if last_matched_col == "col_top":
-                    pd_col_new_names.append(f"extra_pre{suffix}")
-                else:
-                    pd_col_new_names.append(f"extra_{last_matched_col}{suffix}")
-
-        pd_col_new_names = [name + "_pd" for name in pd_col_new_names]
-        pd_df.columns = pandas.Index(pd_col_new_names)
-
-        # CSVのヘッダ名は列対応の判定には使うが、OCR正解率の採点対象にはしない。
-        # 以前は account / amount_0 / amount_1 等を1データ行として追加していたため、
-        # ヘッダ一致が「OCR正解1件」として混入していた。
-        return gt_df, pd_df
-
-
-    def _create_column_profiles(self, df: pandas.DataFrame, cols: List[str], max_len: int = 1500) -> List[str]:
-        profiles = []
-        for col_name in cols:
-            valid_data = df[col_name].dropna().astype(str)
-            data_str = "".join(valid_data)
-            normalized_str = self._normalize_text(col_name + data_str)
-            profiles.append(normalized_str[:max_len])
-        return profiles
-
-
-    def _calculate_column_similarity_scores(
-        self, gt_cols: List[str], gt_profs: List[str], pd_cols: List[str], pd_profs: List[str]
-    ) -> List[Dict[str, float]]:
-        scored_matches = []
-        for gt_idx, (gt_col, gt_profile) in enumerate(zip(gt_cols, gt_profs)):
-            gt_header_norm = self._normalize_text(gt_col)
-
-            for pd_idx, (pd_col, pd_profile) in enumerate(zip(pd_cols, pd_profs)):
-                pd_header_norm = self._normalize_text(pd_col)
-
-                header_sim = self._get_similarity(gt_header_norm, pd_header_norm)
-                full_sim = self._get_similarity(gt_profile, pd_profile)
-
-                if header_sim < 0.3 and full_sim < 0.3:
-                    continue
-
-                pos_sim = 1.0 - (abs(gt_idx / len(gt_cols) - pd_idx / len(pd_cols)))
-                score = (full_sim * 0.5) + (header_sim * 0.4) + (pos_sim * 0.1)
-
-                scored_matches.append({'gt_idx': gt_idx, 'pd_idx': pd_idx, 'score': score})
-
-        return sorted(scored_matches, key=lambda x: x['score'], reverse=True)
-
-
-    def _determine_column_mapping(self, sorted_matches: List[Dict[str, float]], pd_cols: List[str]) -> Dict[str, str]:
-        mapping = {}
-        matched_gt, matched_pd = set(), set()
-
-        for match in sorted_matches:
-            gt_idx, pd_idx = int(match['gt_idx']), int(match['pd_idx'])
-            if gt_idx not in matched_gt and pd_idx not in matched_pd:
-                mapping[pd_cols[pd_idx]] = f"c{gt_idx}"
-                matched_gt.add(gt_idx)
-                matched_pd.add(pd_idx)
-
-        return mapping
-
-
     def _insert_headers_as_data_row(self, df: pandas.DataFrame, original_headers: List[str]) -> None:
         padding = [""] * (len(df.columns) - len(original_headers))
         df.loc[-1] = original_headers + padding
