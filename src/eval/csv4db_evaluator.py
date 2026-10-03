@@ -16,6 +16,7 @@ from src import constants as const
 from src.utils import fileutils 
 from src.eval.excel_exporter import KessanExcelExporter
 from src.service.classification_service import ClassificationService
+from src.service.ocr_evaluation_service import OcrEvaluationService
 
 class Csv4dbEvaluator:
     """
@@ -41,6 +42,12 @@ class Csv4dbEvaluator:
         self.classification_service = ClassificationService(self.FORM_ID_MAP)
 
         self._prepare()
+
+        self.ocr_evaluation_service = OcrEvaluationService(
+            self.predictions_dir,
+            self.session_dir,
+            self.FORM_ID_MAP,
+        )
 
 
     def _prepare(self) -> None:
@@ -175,7 +182,7 @@ class Csv4dbEvaluator:
                             orig_group, page_group_text = m_group.group(1), m_group.group(2)
                             sidecar_group = json.loads(sidecar_path_group.read_text(encoding='utf-8'))
                             region_group = sidecar_group.get(orig_group, {}).get(str(int(page_group_text)), [])
-                            grouped_merged, ocr_scored_formids, ocr_unscored_formids = self._compare_detail_by_formid(
+                            grouped_merged, ocr_scored_formids, ocr_unscored_formids = self.ocr_evaluation_service._compare_detail_by_formid(
                                 gt_file, orig_group, int(page_group_text), region_group
                             )
                     except Exception as e:
@@ -573,107 +580,6 @@ class Csv4dbEvaluator:
             out(label(6), cell(6, value_cols[5])),
         ]
         return pandas.DataFrame(rows, columns=['account', 'amount_0'])
-
-    def _compare_detail_by_formid(self, gt_file: Path, orig_name: str, page_index: int, region_items: list):
-        """formid付きGT detailを、AIReadの同一formid regionと帳票単位で比較する。
-
-        1物理ページに複数帳票がある場合、列構造が異なるregionを先に連結すると
-        fuzzy column alignmentが別帳票の列へ吸われる。そこで帳票ごとに独立して
-        column/row alignmentを行い、採点後のDataFrameだけを連結する。
-        """
-        try:
-            gt_all = pandas.read_csv(gt_file, dtype=str, keep_default_na=False)
-        except Exception as e:
-            logging.warning("formid付きGT detail読込失敗: %s", e)
-            return None, [], []
-        if "formid" not in gt_all.columns:
-            return None, [], []
-
-        gt_ids = [str(v).strip() for v in gt_all["formid"].tolist() if str(v).strip()]
-        ordered_ids = list(dict.fromkeys(gt_ids))
-        merged_parts = []
-        scored_ids = []
-        temp_dir = self.session_dir / '.logical_ocr_inputs'
-        temp_dir.mkdir(parents=True, exist_ok=True)
-
-        for seq, formid in enumerate(ordered_ids, start=1):
-            gt_part = gt_all[gt_all["formid"].astype(str).str.strip() == formid].drop(columns=["formid"])
-            candidates = []
-            for item in sorted(region_items, key=lambda x: int(x.get('region', 0) or 0)):
-                if str(item.get('formid', '')).strip() != formid or not item.get('detail_file'):
-                    continue
-                path = self.predictions_dir / '.logical_region_details' / str(item['detail_file'])
-                if path.exists():
-                    candidates.append((item, path))
-            if not candidates:
-                logging.warning("  ⚠ P%d OCR detail: GT=%s に対応するregion detailなし", page_index + 1, formid)
-                # 予測空CSVを作り、GT全項目を不一致として残す
-                pd_part = pandas.DataFrame(columns=gt_part.columns)
-            else:
-                frames = [pandas.read_csv(path, dtype=str, keep_default_na=False) for _, path in candidates]
-                pd_part = pandas.concat(frames, ignore_index=True, sort=False).fillna('')
-                scored_ids.extend([formid] * len(candidates))
-                logging.info("  🧩 P%d OCR帳票別比較: %s -> %s", page_index + 1, formid,
-                             [f"R{x.get('region')}" for x, _ in candidates])
-
-            # 株主資本等変動計算書だけはAIReadが横持ちマトリクスで返すため、
-            # OCR文字を補正せず、比較用の縦持ちへ展開してから既存ロジックへ渡す。
-            if formid == "01_050_02" and not pd_part.empty:
-                pd_part = self._normalize_equity_matrix_detail(pd_part)
-                logging.info("  ↕ P%d 株主資本等変動計算書: 横持ち -> 縦持ち比較へ変換 (%d行)",
-                             page_index + 1, len(pd_part))
-
-            gt_tmp = temp_dir / f"{orig_name}_{page_index}_GT_{seq}.csv"
-            pd_tmp = temp_dir / f"{orig_name}_{page_index}_PD_{seq}.csv"
-            gt_part.to_csv(gt_tmp, index=False, encoding='utf-8-sig')
-            pd_part.to_csv(pd_tmp, index=False, encoding='utf-8-sig')
-            gt_df, pd_df = self._load_csv_to_dataframe(gt_tmp, pd_tmp)
-            if gt_df is None or pd_df is None:
-                continue
-            # P3の先頭「株主資本」は階層見出しで、横持ちAIRead表に対応セルがない。
-            # 位置対応の前にこの1行だけ外し、25行対25行で比較する。
-            if formid == "01_050_02" and len(gt_df) == len(pd_df) + 1 and not gt_df.empty:
-                first_gt = str(gt_df.iloc[0, 0]).strip()
-                if first_gt == "株主資本":
-                    gt_df = gt_df.iloc[1:].reset_index(drop=True)
-                    logging.info("  ↕ P%d 株主資本等変動計算書: 先頭構造見出し『株主資本』をOCR採点から除外", page_index + 1)
-            gt_df, pd_df = self._align_columns_by_fuzzy_match(gt_df, pd_df)
-            if formid == "01_050_02":
-                # 株主資本等変動計算書は上でGTと同じ論理位置へ25行展開済み。
-                # ここでfuzzy行寄せを行うと、OCR誤読された行名の類似度が低いため
-                # 正しい物理位置から後半へ飛ばされる。P3だけ位置対応で比較する。
-                gt_df = gt_df.reset_index(drop=True)
-                pd_df = pd_df.reset_index(drop=True)
-                gt_df['row_id'] = [f"r{i}" for i in range(len(gt_df))]
-                pd_df['row_id'] = [f"r{i}" for i in range(len(pd_df))]
-                logging.info("  ↕ P%d 株主資本等変動計算書: 25行の論理位置で直接比較", page_index + 1)
-            else:
-                gt_df, pd_df = self._align_rows_by_fuzzy_match(gt_df, pd_df)
-            part = pandas.merge(gt_df, pd_df, on='row_id', how='outer', indicator='row_presence', validate='many_to_many')
-            for _col in part.columns:
-                if _col != 'row_presence':
-                    part[_col] = part[_col].fillna('')
-            part[['item_count', 'match_count', 'accuracy']] = part.apply(self._calc_data_accuracy_by_row, axis=1)
-            # 帳票をまたいでrow_idが衝突しないようにする
-            part['row_id'] = part['row_id'].astype(str).map(lambda x: f"f{seq}_{x}")
-            part['logical_formid'] = formid
-            merged_parts.append(part)
-
-        if not merged_parts:
-            return None, [], []
-        merged = pandas.concat(merged_parts, ignore_index=True, sort=False)
-        for _col in merged.columns:
-            if _col != 'row_presence':
-                merged[_col] = merged[_col].fillna('')
-        unscored = [
-            str(x.get('formid', '')).strip() for x in region_items
-            if str(x.get('formid', '')).strip() in self.FORM_ID_MAP
-            and str(x.get('formid', '')).strip() not in ordered_ids
-        ]
-        merged.attrs['ocr_scored_formids'] = scored_ids
-        merged.attrs['ocr_unscored_formids'] = unscored
-        merged.attrs['logical_detail_grouped'] = True
-        return merged, scored_ids, unscored
 
     def _load_csv_to_dataframe(self, gt_path: Path, pd_path: Path) -> Tuple[Optional[pandas.DataFrame], Optional[pandas.DataFrame]]:
         """正解データと比較対象データの両方のcsvを読み込む。（数値のカンマで列が壊れるのを防止）"""
